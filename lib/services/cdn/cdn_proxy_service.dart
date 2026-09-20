@@ -10,6 +10,7 @@
 import 'dart:async';
 
 import 'package:PiliPlus/services/cdn/cdn_proxy.dart';
+import 'package:PiliPlus/utils/platform_utils.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
 
 class CdnProxyService {
@@ -47,13 +48,18 @@ class CdnProxyService {
 
   Future<CdnProxy?> _start(int? connections) async {
     try {
+      // 缓冲上限按平台给：视频+音频两条流，各自一份。移动端给 32MB（合计约 64MB 峰值），
+      // 桌面给 64MB。上限只影响"能回看多远"，超了会丢最远的数据再重取，不影响正确性。
+      final bufferLimit = PlatformUtils.isMobile
+          ? 32 * 1024 * 1024
+          : 64 * 1024 * 1024;
       final proxy = CdnProxy(
         connections: connections ?? Pref.cdnProxyConnections,
         // 512KiB × 8 连接 = 一次最多 4MiB，够填满 mpv 的读窗口
         chunkBytes: 512 * 1024,
         // 预取 8MiB：太小会频繁等网络，太大浪费流量
         prefetchAhead: 8 * 1024 * 1024,
-        bufferLimit: 64 * 1024 * 1024,
+        bufferLimit: bufferLimit,
         userAgent: _userAgent,
       );
       await proxy.start();
