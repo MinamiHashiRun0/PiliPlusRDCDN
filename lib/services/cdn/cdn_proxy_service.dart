@@ -67,7 +67,7 @@ class CdnProxyService {
       _proxy = proxy;
       _lastError = null;
       CdnDebugLog.marker(
-        '代理启动 :${proxy.port} · 并发 $connections 条 · 缓冲上限 '
+        '代理启动 :${proxy.port} · 并发 ${proxy.connectionCount} 条 · 缓冲上限 '
         '${bufferLimit ~/ (1024 * 1024)}MB/流 · 预取 '
         '${proxy.prefetchAhead ~/ (1024 * 1024)}MB',
       );

@@ -201,6 +201,9 @@ class CdnProxy {
   int get port => _server?.port ?? 0;
   bool get isRunning => _server != null;
 
+  /// 实际生效的并发连接数（用于日志——之前打印的是入参，永远是 null）。
+  int get connectionCount => connections;
+
   /// 启动本地监听（只绑 127.0.0.1）。
   Future<int> start() async {
     if (_server != null) return port;

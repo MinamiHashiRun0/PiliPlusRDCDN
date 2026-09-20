@@ -17,6 +17,7 @@ import 'package:PiliPlus/models/user/danmaku_rule.dart';
 import 'package:PiliPlus/models/video/play/url.dart';
 import 'package:PiliPlus/models_new/video/video_shot/data.dart';
 import 'package:PiliPlus/services/cdn/cdn_proxy_service.dart';
+import 'package:PiliPlus/services/cdn/cdn_debug_log.dart';
 import 'package:PiliPlus/pages/danmaku/danmaku_model.dart';
 import 'package:PiliPlus/pages/sponsor_block/block_mixin.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
@@ -1070,6 +1071,71 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         }
       }),
     ];
+    // 播放器侧状态采样（仅在开启 CDN 调试日志时生效）
+    _startCdnSampler();
+  }
+
+  Timer? _cdnSampler;
+  int _cdnSamplePosSec = -1;
+  DateTime? _cdnSampleAt;
+  bool _cdnWasBuffering = false;
+
+  /// 每 2 秒记录一次播放器侧状态。
+  ///
+  /// 这是整条链路里最缺的一环：此前只有网络侧指标（聚合吞吐 92–213 Mbps），
+  /// 而"缓冲垫了多少秒、播放器实际消费多少、有没有卡顿"全是空白，所以无法判断卡顿
+  /// 出在网络还是播放器。有了它，三种情形可以直接区分：
+  ///   * 前向缓冲长期接近 0 且 consumed ≈ 码率 → 网络供不上
+  ///   * 前向缓冲很大仍然卡                    → 解码/渲染问题
+  ///   * consumed 远低于码率                   → 播放器主动停读（缓冲已足）
+  void _startCdnSampler() {
+    if (!CdnDebugLog.enabled) return;
+    _cdnSampler?.cancel();
+    _cdnSamplePosSec = -1;
+    _cdnSampleAt = null;
+    _cdnWasBuffering = false;
+    _cdnSampler = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (!CdnDebugLog.enabled) return;
+      try {
+        final posSec = position.value;
+        final bufSec = buffered.value;
+        final durSec = duration.value;
+        final now = DateTime.now();
+        final prevPos = _cdnSamplePosSec;
+        final prevAt = _cdnSampleAt;
+
+        double? consumed;
+        if (prevPos >= 0 && prevAt != null) {
+          final dt = now.difference(prevAt).inMilliseconds;
+          final dp = posSec - prevPos;
+          // 只在窗口内确实前进过时才算，避免暂停/拖动污染均值
+          if (dt > 0 && dp > 0) {
+            consumed = dp * 8 / (dt / 1000) / 1000;
+          }
+        }
+
+        final buffering = isBuffering.value;
+        final stalled = buffering && !_cdnWasBuffering;
+        _cdnWasBuffering = buffering;
+        _cdnSamplePosSec = posSec;
+        _cdnSampleAt = now;
+
+        CdnDebugLog.sample(
+          CdnPlayerSample(
+            at: now,
+            positionMs: posSec * 1000,
+            // 前向缓冲 = 已缓冲到的绝对位置 - 当前播放位置
+            // （两者单位都是秒，见 stream.buffer / stream.position 的监听）
+            bufferMs: (bufSec - posSec).clamp(0, 1 << 30) * 1000,
+            durationMs: durSec * 1000,
+            buffering: buffering,
+            stalled: stalled,
+            consumedMbps: consumed,
+            proxyMbps: null, // 代理侧吞吐在 [agg] 行，这里不重复
+          ),
+        );
+      } catch (_) {}
+    });
   }
 
   /// 移除事件监听
@@ -1596,6 +1662,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       AndroidHelper$ToDart.onUserLeaveHint = null;
     }
     _timer?.cancel();
+    _cdnSampler?.cancel();
+    _cdnSampler = null;
     // 播放页销毁：释放本地代理的引用（没有引用时它会自己停掉，省电、让出端口）
     if (CdnProxyService.instance.isRunning) {
       unawaited(CdnProxyService.instance.release());

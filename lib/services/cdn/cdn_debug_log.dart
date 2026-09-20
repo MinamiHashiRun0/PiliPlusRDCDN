@@ -108,6 +108,56 @@ class CdnRequestRecord {
       '${t.millisecond.toString().padLeft(3, '0')}';
 }
 
+/// 播放器侧的一次采样。
+class CdnPlayerSample {
+  CdnPlayerSample({
+    required this.at,
+    required this.positionMs,
+    required this.bufferMs,
+    required this.durationMs,
+    required this.buffering,
+    required this.stalled,
+    this.consumedMbps,
+    this.proxyMbps,
+  });
+
+  final DateTime at;
+  final int positionMs;
+
+  /// 已缓冲到多远（相对播放位置的**前向**缓冲量，由调用方换算）。
+  final int bufferMs;
+  final int durationMs;
+  final bool buffering;
+
+  /// 与上一次采样相比是否发生了新的卡顿。
+  final bool stalled;
+
+  /// 这段窗口内播放器实际消费的码率。**判断"够不够播"就看它**。
+  final double? consumedMbps;
+
+  /// 同期代理侧的聚合吞吐（有代理时才有）。
+  final double? proxyMbps;
+
+  String toLine() {
+    final posS = (positionMs / 1000).toStringAsFixed(0);
+    final bufS = (bufferMs / 1000).toStringAsFixed(1);
+    final totalS = durationMs <= 0
+        ? '?'
+        : (durationMs / 1000).toStringAsFixed(0);
+    final b = StringBuffer()
+      ..write('[play] ')
+      ..write(CdnRequestRecord._ts(at))
+      ..write(' pos=${posS}s/$totalS buffer=${bufS}s');
+    final c = consumedMbps;
+    if (c != null) b.write(' consumed=${c.toStringAsFixed(1)}Mbps');
+    final p = proxyMbps;
+    if (p != null) b.write(' proxy=${p.toStringAsFixed(1)}Mbps');
+    if (buffering) b.write(' BUFFERING');
+    if (stalled) b.write(' STALLED');
+    return b.toString();
+  }
+}
+
 abstract final class CdnDebugLog {
   static const int _maxLines = 400;
   static final List<String> _lines = [];
@@ -220,10 +270,29 @@ abstract final class CdnDebugLog {
     log('--- $text ---');
   }
 
+  /// 周期性记录播放器侧状态。
+  ///
+  /// 为什么必须记这个：此前只埋了网络侧指标，于是"为什么卡"根本无从判断——
+  /// 网络聚合吞吐有 92–213 Mbps，但播放器消费速率、缓冲深度、卡顿次数全都是空的。
+  /// 有了这几项才能区分：
+  ///   * 缓冲深度长期很小 + 消费速率 ≈ 码率 → 网络供不上（该优化下载）
+  ///   * 缓冲深度够大仍然卡                     → 问题在解码/渲染
+  ///   * 消费速率远低于码率                     → 播放器主动暂停读取（缓冲已足）
+  static void sample(CdnPlayerSample s) {
+    if (!_enabled) return;
+    _samples.add(s);
+    if (_samples.length > 120) _samples.removeRange(0, _samples.length - 120);
+    log(s.toLine());
+  }
+
+  static final List<CdnPlayerSample> _samples = [];
+  static List<CdnPlayerSample> get samples => List.unmodifiable(_samples);
+
   /// 清空（内存与文件）。
   static Future<void> clear() async {
     _lines.clear();
     _records.clear();
+    _samples.clear();
     _seq = 0;
     try {
       await _sink?.flush();
