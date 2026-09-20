@@ -101,6 +101,9 @@ abstract final class SettingBoxKey {
 
       /// 代理的并发连接数
       cdnProxyConnections = 'cdnProxyConnections',
+
+      /// CDN 调试日志开关（记录每次媒体请求的耗时与吞吐）
+      cdnDebugLog = 'cdnDebugLog',
       horizontalPreview = 'horizontalPreview',
       banWordForReply = 'banWordForReply',
       banWordForZone = 'banWordForZone',

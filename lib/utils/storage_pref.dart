@@ -456,6 +456,10 @@ abstract final class Pref {
           ?.clamp(2, 16) ??
       8;
 
+  /// CDN 调试日志开关。默认关：记录本身有开销，只在排查时开。
+  static bool get cdnDebugLog =>
+      _setting.get(SettingBoxKey.cdnDebugLog, defaultValue: false);
+
   static bool get autoUpdate =>
       _setting.get(SettingBoxKey.autoUpdate, defaultValue: true);
 

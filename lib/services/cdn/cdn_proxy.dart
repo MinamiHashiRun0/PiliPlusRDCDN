@@ -18,10 +18,26 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data' show Uint8List, BytesBuilder;
 
+import 'package:PiliPlus/services/cdn/cdn_debug_log.dart';
 import 'package:PiliPlus/services/cdn/proxy_core.dart';
 
 export 'package:PiliPlus/services/cdn/proxy_core.dart'
     show ByteRange, RangeRequest, ContentRange, planChunks, ByteBufferIndex;
+
+/// 一次请求的统计，用于日志与"瓶颈在网络还是在播放器"的判断。
+class _RequestStats {
+  int upstream = 0;
+  int fallback = 0;
+  bool aborted = false;
+
+  /// 花在"从上游取字节"上的时间。
+  int netMs = 0;
+
+  /// 花在"把字节写给 mpv"上的时间。
+  int writeMs = 0;
+
+  final Stopwatch total = Stopwatch()..start();
+}
 
 /// 播放器侧要引用的媒体。
 class ProxyTrack {
@@ -195,8 +211,10 @@ class CdnProxy {
 
   Future<void> _handle(HttpRequest req) async {
     final res = req.response;
+    final stats = _RequestStats();
+    ProxyTrack? track;
     try {
-      final track = _trackFromPath(req.uri.path);
+      track = _trackFromPath(req.uri.path);
       if (track == null) {
         res.statusCode = HttpStatus.notFound;
         await res.close();
@@ -211,7 +229,7 @@ class CdnProxy {
         if (referer.isNotEmpty) 'Referer': referer,
       };
 
-      final size = await _ensureTotal(track, extra);
+      final size = await _ensureTotal(track, extra, stats);
       final wanted = RangeRequest.parse(req.headers.value(HttpHeaders.rangeHeader));
       final range = wanted?.resolve(size) ??
           (size > 0 ? ByteRange(0, size - 1) : null);
@@ -222,11 +240,13 @@ class CdnProxy {
           totalUnavailable++;
           res.statusCode = HttpStatus.badGateway;
           await res.close();
+          _logRequest(track, wanted, stats, 0, '拿不到资源大小 → 502');
           return;
         }
         res.statusCode = HttpStatus.requestedRangeNotSatisfiable;
         res.headers.set(HttpHeaders.contentRangeHeader, 'bytes */$size');
         await res.close();
+        _logRequest(track, wanted, stats, 0, 'Range 越界 → 416');
         return;
       }
 
@@ -246,7 +266,7 @@ class CdnProxy {
       res.headers.set(HttpHeaders.contentLengthHeader, '${range.length}');
 
       // 先起读循环（兜底路径靠它），再补网络数据进来
-      unawaited(_pump(track, range, res, extra));
+      unawaited(_pump(track, range, res, extra, stats, isPartial, wanted));
       _schedulePrefetch(track, range.end + 1, extra);
     } catch (e) {
       errorCount++;
@@ -255,7 +275,37 @@ class CdnProxy {
       try {
         await res.close();
       } catch (_) {}
+      if (track != null) {
+        _logRequest(track, null, stats, 0, '处理异常：$e');
+      }
     }
+  }
+
+  /// 把一次请求的统计写进日志。这是判断"瓶颈在网络还是在播放器"的唯一依据。
+  void _logRequest(
+    ProxyTrack track,
+    RangeRequest? wanted,
+    _RequestStats stats,
+    int bytes, [
+    String? note,
+  ]) {
+    CdnDebugLog.record(
+      CdnRequestRecord(
+        seq: CdnDebugLog.nextSeq(),
+        at: DateTime.now(),
+        label: track.label,
+        range: wanted == null
+            ? '整段'
+            : '${wanted.start ?? ''}-${wanted.end ?? ''}'
+                  '${wanted.suffixLength != null ? ' suffix=${wanted.suffixLength}' : ''}',
+        bytes: bytes,
+        netMs: stats.netMs,
+        upstream: stats.upstream,
+        fallback: stats.fallback,
+        aborted: stats.aborted,
+        note: note,
+      ),
+    );
   }
 
   String _contentTypeFor(String url) {
@@ -269,12 +319,18 @@ class CdnProxy {
   }
 
   /// 探测总长度：发一个 1 字节的 Range，从 Content-Range 里读 total。
-  Future<int> _ensureTotal(ProxyTrack track, Map<String, String> extra) async {
+  Future<int> _ensureTotal(
+    ProxyTrack track,
+    Map<String, String> extra,
+    _RequestStats stats,
+  ) async {
     if (track.total >= 0) return track.total;
+    final sw = Stopwatch()..start();
     try {
       final r = await _openUpstream(track.url, const ByteRange(0, 0), extra);
       final resp = await r.close().timeout(const Duration(seconds: 12));
       upstreamRequests++;
+      stats.upstream++;
       final cr = ContentRange.parse(
         resp.headers.value(HttpHeaders.contentRangeHeader),
       );
@@ -289,6 +345,8 @@ class CdnProxy {
       }
     } catch (_) {
       track.total = -1;
+    } finally {
+      stats.netMs += sw.elapsedMilliseconds;
     }
     return track.total;
   }
@@ -306,38 +364,61 @@ class CdnProxy {
   }
 
   /// 取一段数据进缓冲。**逐块并发**，任一块失败立即抛错（由调用方决定退回直通）。
-  Future<void> _fetch(ProxyTrack track, ByteRange want, Map<String, String> extra) async {
+  ///
+  /// 取块大小按请求长度自适应：固定用小碎块会让 12 条连接对 4MiB 请求拆出 ~342KiB
+  /// 的碎块，请求数翻倍而吞吐不变。这里让它至少覆盖"一次能并行吃下的量"。
+  Future<void> _fetch(
+    ProxyTrack track,
+    ByteRange want,
+    Map<String, String> extra, [
+    _RequestStats? stats,
+  ]) async {
+    final perConn = _chunkSizeFor(want.length);
     final chunks = planChunks(
       want,
       connections: connections,
-      perConn: chunkBytes,
+      perConn: perConn,
     );
     await Future.wait([
-      for (final c in chunks) _fetchChunk(track, c, extra),
+      for (final c in chunks) _fetchChunk(track, c, extra, stats),
     ]);
+  }
+
+  /// 每块多大：不小于 [chunkBytes]，也不让块数超过连接数。
+  int _chunkSizeFor(int wantLength) {
+    if (connections <= 1) return wantLength;
+    final even = (wantLength / connections).ceil();
+    return even > chunkBytes ? even : chunkBytes;
   }
 
   Future<void> _fetchChunk(
     ProxyTrack track,
     ByteRange range,
-    Map<String, String> extra,
-  ) async {
-    final req = await _openUpstream(track.url, range, extra);
-    upstreamRequests++;
-    final resp = await req.close().timeout(const Duration(seconds: 20));
-    if (resp.statusCode != HttpStatus.partialContent) {
-      await resp.drain<void>().catchError((_) {});
-      throw HttpException('上游返回 ${resp.statusCode}，非 206');
+    Map<String, String> extra, [
+    _RequestStats? stats,
+  ]) async {
+    final sw = Stopwatch()..start();
+    try {
+      final req = await _openUpstream(track.url, range, extra);
+      upstreamRequests++;
+      stats?.upstream++;
+      final resp = await req.close().timeout(const Duration(seconds: 20));
+      if (resp.statusCode != HttpStatus.partialContent) {
+        await resp.drain<void>().catchError((_) {});
+        throw HttpException('上游返回 ${resp.statusCode}，非 206');
+      }
+      final got = <int>[];
+      await for (final part in resp.timeout(const Duration(seconds: 20))) {
+        got.addAll(part);
+        if (got.length >= range.length) break;
+      }
+      if (got.length < range.length) {
+        throw HttpException('上游只给了 ${got.length}/${range.length} 字节');
+      }
+      track.put(range, got.sublist(0, range.length));
+    } finally {
+      stats?.netMs += sw.elapsedMilliseconds;
     }
-    final got = <int>[];
-    await for (final part in resp.timeout(const Duration(seconds: 20))) {
-      got.addAll(part);
-      if (got.length >= range.length) break;
-    }
-    if (got.length < range.length) {
-      throw HttpException('上游只给了 ${got.length}/${range.length} 字节');
-    }
-    track.put(range, got.sublist(0, range.length));
   }
 
   /// 按顺序把字节写给 mpv。
@@ -349,45 +430,62 @@ class CdnProxy {
     ByteRange range,
     HttpResponse res,
     Map<String, String> extra,
+    _RequestStats stats,
+    bool isPartial,
+    RangeRequest? wanted,
   ) async {
     var offset = range.start;
     final end = range.end;
+    var written = 0;
     try {
       while (offset <= end) {
         // 1) 缓冲里已连续的字节直接发
         final contiguous = track.buffer.contiguousEndFrom(offset);
         if (contiguous >= offset) {
           final stop = contiguous > end ? end : contiguous;
+          final sw = Stopwatch()..start();
           final data = track.take(offset, stop);
           res.add(data);
           await res.flush();
+          stats.writeMs += sw.elapsedMilliseconds;
+          written += data.length;
           offset = stop + 1;
           continue;
         }
-        // 2) 缺：取一段（至少覆盖到请求末尾，或一个 chunk）
+        // 2) 缺：取一段（至少覆盖到请求末尾，或一次能并行吃下的量）
         final fetchEnd = _min(end, offset + chunkBytes * connections - 1);
         final want = ByteRange(offset, fetchEnd);
         try {
-          await _fetch(track, want, extra);
+          await _fetch(track, want, extra, stats);
         } catch (e) {
-          final ok = await _passthrough(track, ByteRange(offset, end), res, extra);
+          final sw = Stopwatch()..start();
+          final before = stats.upstream;
+          final ok = await _passthrough(track, ByteRange(offset, end), res, extra, stats);
+          stats.writeMs += sw.elapsedMilliseconds;
           if (ok) {
             fallbackCount++;
+            stats.fallback++;
+            written += end - offset + 1;
           } else {
             // 直通也拿不到：这时响应头早已发出，只能毁掉连接。
             // 吐一个"长度对但内容为空"的响应更糟 —— 播放器会把它当成有效数据。
             abortedForBadUpstream++;
+            stats.aborted = true;
             await _abort(res);
           }
+          if (stats.upstream == before) stats.upstream++; // 至少记一次尝试
           return;
         }
         if (track.buffer.contiguousEndFrom(offset) < offset) {
           // 取回来了却没有覆盖 offset：说明上游行为异常，直通
-          final ok = await _passthrough(track, ByteRange(offset, end), res, extra);
+          final ok = await _passthrough(track, ByteRange(offset, end), res, extra, stats);
           if (ok) {
             fallbackCount++;
+            stats.fallback++;
+            written += end - offset + 1;
           } else {
             abortedForBadUpstream++;
+            stats.aborted = true;
             await _abort(res);
           }
           return;
@@ -399,6 +497,13 @@ class CdnProxy {
       try {
         await res.close();
       } catch (_) {}
+      _logRequest(
+        track,
+        wanted,
+        stats,
+        written,
+        isPartial ? null : '整段请求',
+      );
     }
   }
 
@@ -413,31 +518,38 @@ class CdnProxy {
     ProxyTrack track,
     ByteRange range,
     HttpResponse res,
-    Map<String, String> extra,
-  ) async {
-    final req = await _openUpstream(track.url, range, extra);
-    upstreamRequests++;
-    final resp = await req.close();
-    final ok =
-        resp.statusCode == HttpStatus.partialContent ||
-        resp.statusCode == HttpStatus.ok;
-    if (!ok) {
-      await resp.drain<void>().catchError((_) {});
-      return false;
-    }
-    var written = 0;
-    await for (final part in resp) {
-      if (written >= range.length) break;
-      var take = part;
-      final remain = range.length - written;
-      if (part.length > remain) {
-        // 流里给的是 List<int>，不能直接 sublistView（那要求 TypedData）
-        take = part.sublist(0, remain);
+    Map<String, String> extra, [
+    _RequestStats? stats,
+  ]) async {
+    final sw = Stopwatch()..start();
+    try {
+      final req = await _openUpstream(track.url, range, extra);
+      upstreamRequests++;
+      stats?.upstream++;
+      final resp = await req.close();
+      final ok =
+          resp.statusCode == HttpStatus.partialContent ||
+          resp.statusCode == HttpStatus.ok;
+      if (!ok) {
+        await resp.drain<void>().catchError((_) {});
+        return false;
       }
-      res.add(take);
-      written += take.length;
+      var written = 0;
+      await for (final part in resp) {
+        if (written >= range.length) break;
+        var take = part;
+        final remain = range.length - written;
+        if (part.length > remain) {
+          // 流里给的是 List<int>，不能直接 sublistView（那要求 TypedData）
+          take = part.sublist(0, remain);
+        }
+        res.add(take);
+        written += take.length;
+      }
+      return written == range.length;
+    } finally {
+      stats?.netMs += sw.elapsedMilliseconds;
     }
-    return written == range.length;
   }
 
   /// 毁掉这条连接。用在"响应头已发出、但拿不到数据"的场合。

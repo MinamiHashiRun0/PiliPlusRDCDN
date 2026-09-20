@@ -272,6 +272,17 @@ class CdnProbeReport {
   }
 }
 
+/// 默认偏好的节点。
+///
+/// 实测依据（PC 端、跨境到大陆）：`upos-sz-mirror08c`（华为云**融合** CDN）的单连接吞吐
+/// 是所有候选里最高的（24.5 Mbps，同批 hw 系 21–23、ali 系 13–15），而播放器只吃单连接。
+/// 用户侧观察一致：24MB 缓冲能稳定领先播放进度不缩水。融合 CDN 由多家云聚合调度，
+/// 本身不是单一厂商节点，所以"融合反而更快"是合理的。
+///
+/// 注意这只是**偏好**而不是硬编码：一旦有实测排名，排名里更快的节点仍会顶掉它——
+/// 把一个节点钉死成长期默认，等于又把"按实测选"这件事取消了。
+const String kPreferredCdnHost = 'upos-sz-mirror08c.bilivideo.com';
+
 class CdnProbeConfig {
   const CdnProbeConfig({
     this.singleBytes = 4 * 1024 * 1024,
@@ -409,11 +420,13 @@ class CdnProbe {
   /// 1. 未被剔除的、吞吐达标的进排名
   /// 2. 吞吐优先，同速看延迟
   /// 3. hkFirst 时先取第一个港澳台/海外节点（没有就回落全场第一）
+  /// 4. [preferredHost] 在没有任何可用排名时兜底；排名可用时**不干预**排名结果
   CdnProbeReport rank(
     List<CdnProbeResult> results, {
     required String sampleUrl,
     String? videoKey,
     String? noPickNote,
+    String? preferredHost,
   }) {
     final usable = [
       for (final e in results)
@@ -428,6 +441,17 @@ class CdnProbe {
     if (config.hkFirst) {
       for (final e in usable) {
         if (e.region == CdnRegion.overseas) {
+          pick = e;
+          break;
+        }
+      }
+    }
+
+    // 兜底偏好：只在"一个可用候选都没有"时出手。有排名时不动排名结果——
+    // 否则就等于把测速又变成摆设。
+    if (pick == null && preferredHost != null) {
+      for (final e in results) {
+        if (e.host == preferredHost) {
           pick = e;
           break;
         }

@@ -56,6 +56,7 @@ import 'package:PiliPlus/pages/setting/pages/bar_set.dart';
 import 'package:PiliPlus/pages/setting/pages/color_select.dart';
 import 'package:PiliPlus/pages/setting/pages/display_mode.dart';
 import 'package:PiliPlus/pages/setting/pages/font_setting.dart';
+import 'package:PiliPlus/pages/setting/pages/cdn_debug.dart';
 import 'package:PiliPlus/pages/setting/pages/logs.dart';
 import 'package:PiliPlus/pages/setting/pages/play_speed_set.dart';
 import 'package:PiliPlus/pages/setting/view.dart';
@@ -142,6 +143,8 @@ class Routes {
     GetPage(name: '/memberDynamics', page: () => const MemberDynamicsPage()),
     // 日志
     GetPage(name: '/logs', page: () => const LogsPage()),
+    // CDN 诊断（并发代理的请求指标）
+    GetPage(name: '/cdnDebug', page: () => const CdnDebugPage()),
     // 订阅
     GetPage(name: '/subscription', page: () => const SubPage()),
     // 订阅详情

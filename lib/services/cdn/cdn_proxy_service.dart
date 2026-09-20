@@ -107,16 +107,28 @@ class CdnProxyService {
     } catch (_) {}
   }
 
+  /// 流标签，用于日志可读性。
+  ///
+  /// B 站 m4s 文件名形如 `42009365316-1-30032.m4s`：`-轨号-清晰度`，轨号 1=视频、2=音频。
+  /// 之前只按 `-1-`/`-2-` 判断，遇到不匹配的形态就退回 host（于是日志里出现了 "7"）。
+  static final _trackRe = RegExp(r'-(\d+)-(\d+)\.m4s$');
+
   static String _labelOf(String url) {
-    final uri = Uri.tryParse(url);
-    final path = uri?.path ?? '';
-    if (path.contains('30080') || path.endsWith('.m4s')) {
-      // B 站的 m4s 分片：路径里带 -1-（视频轨）/-2-（音频轨）
-      if (path.contains('-2-')) return 'audio';
-      if (path.contains('-1-')) return 'video';
-      return 'media';
+    final path = Uri.tryParse(url)?.path ?? '';
+    final m = _trackRe.firstMatch(path);
+    if (m != null) {
+      final track = m.group(1);
+      final qn = m.group(2);
+      final kind = switch (track) {
+        '1' => 'video',
+        '2' => 'audio',
+        _ => 'track$track',
+      };
+      return '$kind(qn$qn)';
     }
-    return uri?.host ?? 'media';
+    if (path.contains('-2-')) return 'audio';
+    if (path.contains('-1-')) return 'video';
+    return 'media';
   }
 
   static const _userAgent =

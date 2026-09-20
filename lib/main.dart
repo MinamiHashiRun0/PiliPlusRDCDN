@@ -32,6 +32,7 @@ import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:PiliPlus/utils/theme_utils.dart';
 import 'package:PiliPlus/utils/utils.dart';
 import 'package:PiliPlus/utils/video_utils.dart';
+import 'package:PiliPlus/services/cdn/cdn_debug_log.dart';
 import 'package:catcher_2/catcher_2.dart';
 import 'package:collection/collection.dart';
 import 'package:dynamic_color/dynamic_color.dart' show DynamicColorPlugin;
@@ -104,6 +105,8 @@ void main() async {
   ScaledWidgetsFlutterBinding.instance.scaleFactor = Pref.uiScale;
   // VideoUtils 是纯工具（不依赖存储），偏好在这里注入一次。
   VideoUtils.bootstrap();
+  // CDN 调试日志：按用户设置决定是否落盘
+  CdnDebugLog.setEnabled(Pref.cdnDebugLog);
   await Future.wait([
     _initDownPath(),
     _initTmpPath(),

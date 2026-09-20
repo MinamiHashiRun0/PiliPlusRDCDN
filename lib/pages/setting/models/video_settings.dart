@@ -10,6 +10,7 @@ import 'package:PiliPlus/pages/setting/widgets/ordered_multi_select_dialog.dart'
 import 'package:PiliPlus/pages/setting/widgets/select_dialog.dart';
 import 'package:PiliPlus/plugin/pl_player/models/audio_output_type.dart';
 import 'package:PiliPlus/plugin/pl_player/models/hwdec_type.dart';
+import 'package:PiliPlus/services/cdn/cdn_debug_log.dart';
 import 'package:PiliPlus/services/cdn/cdn_proxy_service.dart';
 import 'package:PiliPlus/utils/filtering_text.dart';
 import 'package:PiliPlus/utils/storage.dart';
@@ -100,6 +101,20 @@ List<SettingsModel> get videoSettings => [
       return '当前：${Pref.cdnProxyConnections} 条（2–16）\n$status';
     },
     onTap: _showProxyConnectionsDialog,
+  ),
+  SwitchModel(
+    title: 'CDN 调试日志',
+    subtitle: '记录每次媒体请求的耗时与吞吐，供诊断；播放时有一定开销，排查完请关闭',
+    leading: const Icon(Icons.receipt_long_outlined),
+    setKey: SettingBoxKey.cdnDebugLog,
+    defaultVal: false,
+    onChanged: CdnDebugLog.setEnabled,
+  ),
+  NormalModel(
+    title: 'CDN 诊断',
+    subtitle: '查看请求指标并整段复制（判断瓶颈在网络还是在播放器）',
+    leading: const Icon(Icons.monitor_heart_outlined),
+    onTap: (context, setState) => Get.toNamed('/cdnDebug'),
   ),
   NormalModel(
     title: '默认画质',
