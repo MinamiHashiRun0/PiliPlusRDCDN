@@ -11,6 +11,7 @@ import 'dart:async';
 
 import 'package:PiliPlus/services/cdn/cdn_debug_log.dart';
 import 'package:PiliPlus/services/cdn/cdn_proxy_service.dart';
+import 'package:PiliPlus/services/cdn/proxy_core.dart';
 import 'package:PiliPlus/utils/utils.dart';
 import 'package:material_ui/material_ui.dart';
 
@@ -143,6 +144,52 @@ class _CdnDebugPageState extends State<CdnDebugPage> {
                           ),
                         ),
                       ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          '缓冲记账微基准',
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            color: scheme.primary,
+                          ),
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: () {
+                          CdnProxyProfiler.reset();
+                          setState(() {});
+                        },
+                        child: const Text('归零'),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  SelectableText(
+                    CdnProxyProfiler.report(),
+                    style: const TextStyle(
+                      fontSize: 11,
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    '怎么读：这些是代理在**主线程**上维护缓冲的纯开销，与网络无关。'
+                    '单次耗时超过 8ms（半帧 @60Hz）就足以在 4K 下造成可感知的交互卡顿；'
+                    'evict 的单次耗时随 range 数增长，是唯一 O(n²) 的热点。',
+                    style: TextStyle(fontSize: 12, color: scheme.outline),
+                  ),
                 ],
               ),
             ),

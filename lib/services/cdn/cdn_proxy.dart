@@ -29,8 +29,8 @@ export 'package:PiliPlus/services/cdn/proxy_core.dart'
 /// 为什么不测量"整个请求耗时"：mpv 缓冲满了就不再读，代理的写操作会被背压卡住，
 /// 那段时间与网络无关。实测踩过：一次 64MiB 请求算出 2.0 Mbps，而视频其实播得好好的。
 /// 逐块计时只覆盖"上游把这段字节发过来"，不含播放器消费时间。
-class _ChunkSample {
-  const _ChunkSample(this.len, this.ms, {this.ok = true});
+class ChunkSample {
+  const ChunkSample(this.len, this.ms, {this.ok = true});
 
   final int len;
   final int ms;
@@ -39,8 +39,38 @@ class _ChunkSample {
   double get mbps => ms <= 0 ? 0 : len * 8 / 1000000 / (ms / 1000);
 }
 
+/// 单次请求内的缓冲记账耗时（微基准）。
+///
+/// 与 [CdnProxyProfiler] 的累计量互补：累计量告诉你"总共有多少开销"，
+/// 这里告诉你"**这一次请求**在记账上花了多少毫秒"——后者才是掉帧判据
+/// （帧预算 16.7ms @60Hz，一次请求若在记账上花几十毫秒，期间任何 UI 交互必掉帧）。
+class RequestProfile {
+  int putUs = 0;
+  int putCount = 0;
+  int takeUs = 0;
+  int takeCount = 0;
+
+  double get putMs => putUs / 1000;
+  double get takeMs => takeUs / 1000;
+  int get evictCount => CdnProxyProfiler.evictCalls;
+  double get evictMs => CdnProxyProfiler.evictUs / 1000;
+
+  /// 记账总耗时（put + take 是本次请求的增量；evict 是全局累计，只作参考）。
+  double get totalMs => putMs + takeMs;
+
+  static RequestProfile of(RequestStats stats) =>
+      stats.profile ??= RequestProfile();
+
+  /// 取走并复位（每请求一个实例，请求结束就丢）。
+  static RequestProfile take(RequestStats stats) {
+    final p = stats.profile ?? RequestProfile();
+    stats.profile = null;
+    return p;
+  }
+}
+
 /// 一次请求的统计，用于日志与"瓶颈在网络还是在播放器"的判断。
-class _RequestStats {
+class RequestStats {
   int upstream = 0;
   int fallback = 0;
   bool aborted = false;
@@ -52,10 +82,13 @@ class _RequestStats {
   int writeMs = 0;
 
   /// 逐块样本：并发窗口内的块各自计时。
-  final List<_ChunkSample> chunks = [];
+  final List<ChunkSample> chunks = [];
 
   /// 取这批块时实际用了多少条并发。
   int concurrency = 1;
+
+  /// 本次请求内的缓冲记账耗时（微基准）。
+  RequestProfile? profile;
 
   final Stopwatch total = Stopwatch()..start();
 
@@ -90,7 +123,8 @@ class _RequestStats {
 
 /// 播放器侧要引用的媒体。
 class ProxyTrack {
-  ProxyTrack({required this.url, this.label = ''});
+  ProxyTrack({required this.url, this.label = '', ByteBufferIndex? buffer})
+    : buffer = buffer ?? ByteBufferIndex();
 
   /// 上游地址（带签名的原始 URL，代理原样使用，只是并发地取）。
   String url;
@@ -99,7 +133,8 @@ class ProxyTrack {
   final String label;
 
   /// 哪些字节已经有了（只记范围，不存数据）。
-  final ByteBufferIndex buffer = ByteBufferIndex();
+  /// 可注入：单测要用很小的 limit 逼出驱逐路径。
+  final ByteBufferIndex buffer;
 
   /// 真实数据：块起始 offset → 该块字节。与 [buffer] 的范围一一对应。
   final Map<int, Uint8List> chunks = {};
@@ -116,11 +151,20 @@ class ProxyTrack {
   /// 取出 [start, end] 的字节。区间必须已被 [buffer] 标记为可用。
   ///
   /// 按块起始 offset 升序拼接，遇到缺口就停下（缺口应由调用方先补齐）。
-  Uint8List take(int start, int end) {
+  ///
+  /// 微基准插桩：`keys.toList()..sort()` 每次调用都要排序一遍全部块键；
+  /// 块数随缓存增长（64MB 缓存 / 512KiB 块 ≈ 上百项）。
+  ///
+  /// [prof] 是**本次请求**的计时归集（可为空：预取路径没有请求上下文）。
+  Uint8List take(int start, int end, [RequestProfile? prof]) {
     if (start > end) return Uint8List(0);
+    final sw = (prof != null || CdnProxyProfiler.enabled)
+        ? (Stopwatch()..start())
+        : null;
     final out = BytesBuilder(copy: false);
     var offset = start;
     final bases = chunks.keys.toList()..sort();
+    final keyCount = bases.length;
     for (final base in bases) {
       if (offset > end) break;
       final data = chunks[base]!;
@@ -132,11 +176,35 @@ class ProxyTrack {
       out.add(Uint8List.sublistView(data, from, to));
       offset = base + to;
     }
-    return out.takeBytes();
+    final bytes = out.takeBytes();
+    if (sw != null) {
+      sw.stop();
+      final us = sw.elapsedMicroseconds;
+      CdnProxyProfiler.takeCalls++;
+      CdnProxyProfiler.takeUs += us;
+      if (us > CdnProxyProfiler.worstTakeUs) {
+        CdnProxyProfiler.worstTakeUs = us;
+        CdnProxyProfiler.worstTakeKeys = keyCount;
+      }
+      if (prof != null) {
+        prof.takeUs += us;
+        prof.takeCount++;
+      }
+    }
+    return bytes;
   }
 
   /// 写入一块数据。
-  void put(ByteRange range, List<int> data) {
+  ///
+  /// 微基准插桩：`buffer.add` 内部是全量合并 + 可能触发 `_evict`（排序）；
+  /// 这里额外测一次"窗口裁剪后同步丢弃数据"的代价。
+  ///
+  /// 注意 `_evict` 的开销计在 `add` 内（[CdnProxyProfiler.worstEvictUs]），
+  /// 这里量的是 put 的总墙钟。
+  void put(ByteRange range, List<int> data, [RequestProfile? prof]) {
+    final sw = (prof != null || CdnProxyProfiler.enabled)
+        ? (Stopwatch()..start())
+        : null;
     chunks[range.start] = data is Uint8List
         ? data
         : Uint8List.fromList(data);
@@ -146,6 +214,16 @@ class ProxyTrack {
     chunks.removeWhere(
       (start, d) => !live.any((r) => r.start <= start && start <= r.end),
     );
+    if (sw != null) {
+      sw.stop();
+      final us = sw.elapsedMicroseconds;
+      CdnProxyProfiler.addCalls++;
+      CdnProxyProfiler.addUs += us;
+      if (prof != null) {
+        prof.putUs += us;
+        prof.putCount++;
+      }
+    }
   }
 
   void reset() {
@@ -263,7 +341,7 @@ class CdnProxy {
 
   Future<void> _handle(HttpRequest req) async {
     final res = req.response;
-    final stats = _RequestStats();
+    final stats = RequestStats();
     ProxyTrack? track;
     try {
       track = _trackFromPath(req.uri.path);
@@ -340,7 +418,7 @@ class CdnProxy {
   void _logRequest(
     ProxyTrack track,
     RangeRequest? wanted,
-    _RequestStats stats,
+    RequestStats stats,
     int bytes, [
     String? note,
   ]) {
@@ -384,7 +462,7 @@ class CdnProxy {
   Future<int> _ensureTotal(
     ProxyTrack track,
     Map<String, String> extra,
-    _RequestStats stats,
+    RequestStats stats,
   ) async {
     if (track.total >= 0) return track.total;
     final sw = Stopwatch()..start();
@@ -433,7 +511,7 @@ class CdnProxy {
     ProxyTrack track,
     ByteRange want,
     Map<String, String> extra, [
-    _RequestStats? stats,
+    RequestStats? stats,
   ]) async {
     final perConn = _chunkSizeFor(want.length);
     final chunks = planChunks(
@@ -460,7 +538,7 @@ class CdnProxy {
     ProxyTrack track,
     ByteRange range,
     Map<String, String> extra, [
-    _RequestStats? stats,
+    RequestStats? stats,
   ]) async {
     final sw = Stopwatch()..start();
     try {
@@ -480,11 +558,11 @@ class CdnProxy {
       if (got.length < range.length) {
         throw HttpException('上游只给了 ${got.length}/${range.length} 字节');
       }
-      track.put(range, got.sublist(0, range.length));
+      track.put(range, got.sublist(0, range.length), _profOf(stats));
       // 逐块样本：这就是"这条路能跑多快"的直接证据
-      stats?.chunks.add(_ChunkSample(range.length, sw.elapsedMilliseconds));
+      stats?.chunks.add(ChunkSample(range.length, sw.elapsedMilliseconds));
     } catch (e) {
-      stats?.chunks.add(_ChunkSample(range.length, sw.elapsedMilliseconds, ok: false));
+      stats?.chunks.add(ChunkSample(range.length, sw.elapsedMilliseconds, ok: false));
       rethrow;
     } finally {
       stats?.netMs += sw.elapsedMilliseconds;
@@ -500,7 +578,7 @@ class CdnProxy {
     ByteRange range,
     HttpResponse res,
     Map<String, String> extra,
-    _RequestStats stats,
+    RequestStats stats,
     bool isPartial,
     RangeRequest? wanted,
   ) async {
@@ -514,7 +592,7 @@ class CdnProxy {
         if (contiguous >= offset) {
           final stop = contiguous > end ? end : contiguous;
           final sw = Stopwatch()..start();
-          final data = track.take(offset, stop);
+          final data = track.take(offset, stop, _profOf(stats));
           res.add(data);
           await res.flush();
           stats.writeMs += sw.elapsedMilliseconds;
@@ -574,6 +652,17 @@ class CdnProxy {
         written,
         isPartial ? null : '整段请求',
       );
+      // 记账微基准：把"这次请求在缓冲记账上花了多少"直接打进日志，
+      // 与 [agg]（网络吞吐）并排看，才能区分卡顿来自网络还是来自主线程记账。
+      final prof = RequestProfile.take(stats);
+      if (prof.putUs > 0 || prof.takeUs > 0) {
+        CdnDebugLog.log(
+          '         [prof] 记账 ${prof.totalMs.toStringAsFixed(1)}ms'
+          '（put ${prof.putMs.toStringAsFixed(1)}ms/${prof.putCount}次'
+          ' · take ${prof.takeMs.toStringAsFixed(1)}ms/${prof.takeCount}次）'
+          '${prof.totalMs >= 8 ? '  ← 超过半帧预算' : ''}',
+        );
+      }
     }
   }
 
@@ -589,7 +678,7 @@ class CdnProxy {
     ByteRange range,
     HttpResponse res,
     Map<String, String> extra, [
-    _RequestStats? stats,
+    RequestStats? stats,
   ]) async {
     final sw = Stopwatch()..start();
     try {
@@ -653,6 +742,10 @@ class CdnProxy {
   }
 
   static int _min(int a, int b) => a < b ? a : b;
+
+  /// 取本次请求的记账归集器（预取等无请求上下文的路径传 null → 只走全局累计）。
+  static RequestProfile? _profOf(RequestStats? stats) =>
+      stats == null ? null : RequestProfile.of(stats);
 
   /// 诊断字符串（面板/日志用）。
   String debugSummary() {

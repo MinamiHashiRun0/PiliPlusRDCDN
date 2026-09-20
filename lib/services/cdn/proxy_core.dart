@@ -149,6 +149,98 @@ List<ByteRange> planChunks(
   return chunks;
 }
 
+/// 缓冲记账的微基准：**纯观测，不改变任何行为**。
+///
+/// 目的：用户在 4K 下"一碰 UI 就卡"的根因需要数字来钉死。若不测量就改架构，
+/// 有可能改完发现问题另有来源。这里插桩四条热路径并给出累计与单次均值：
+///
+///   add     —— 每写入一块都调，内部全量合并 range 列表
+///   evict   —— 缓存超限时调用，内部全量排序 + 循环内反复求 cachedBytes（O(n²)）
+///   has     —— `_ranges.any(...)` 线性扫描
+///   take    —— 每次把字节写给播放器都调，内部 `keys.toList()..sort()`
+///
+/// [perRequest] 是**逐请求归零**的累计量：一次请求从发起到写完的平均单次耗时，
+/// 才是"会不会掉帧"的判据（帧预算 16.7ms @60Hz）。
+abstract final class CdnProxyProfiler {
+  static bool enabled = true;
+
+  static int addCalls = 0;
+  static int addUs = 0;
+  static int evictCalls = 0;
+  static int evictUs = 0;
+  static int hasCalls = 0;
+  static int hasUs = 0;
+  static int takeCalls = 0;
+  static int takeUs = 0;
+
+  /// 单次耗时最高的记录（用于定位最差的一次）。
+  static int worstEvictUs = 0;
+  static int worstEvictRanges = 0;
+  static int worstTakeUs = 0;
+  static int worstTakeKeys = 0;
+
+  static void reset() {
+    addCalls = addUs = evictCalls = evictUs = 0;
+    hasCalls = hasUs = takeCalls = takeUs = 0;
+    worstEvictUs = worstEvictRanges = worstTakeUs = worstTakeKeys = 0;
+  }
+
+  static double _avg(int us, int calls) => calls == 0 ? 0 : us / calls / 1000;
+
+  /// 累计报告（诊断页展示）。
+  static String report() {
+    if (addCalls + evictCalls + hasCalls + takeCalls == 0) {
+      return '缓冲记账：暂无样本（需开启代理并播放）';
+    }
+    final b = StringBuffer()
+      ..write('缓冲记账微基准\n')
+      ..write(
+        '  add   ${addCalls.toString().padLeft(6)} 次  '
+        '累计 ${(addUs / 1000).toStringAsFixed(1)}ms  '
+        '单次 ${_avg(addUs, addCalls).toStringAsFixed(3)}ms\n',
+      )
+      ..write(
+        '  evict ${evictCalls.toString().padLeft(6)} 次  '
+        '累计 ${(evictUs / 1000).toStringAsFixed(1)}ms  '
+        '单次 ${_avg(evictUs, evictCalls).toStringAsFixed(3)}ms\n',
+      )
+      ..write(
+        '  has   ${hasCalls.toString().padLeft(6)} 次  '
+        '累计 ${(hasUs / 1000).toStringAsFixed(1)}ms  '
+        '单次 ${_avg(hasUs, hasCalls).toStringAsFixed(3)}ms\n',
+      )
+      ..write(
+        '  take  ${takeCalls.toString().padLeft(6)} 次  '
+        '累计 ${(takeUs / 1000).toStringAsFixed(1)}ms  '
+        '单次 ${_avg(takeUs, takeCalls).toStringAsFixed(3)}ms',
+      );
+    if (worstEvictUs > 0) {
+      b.write(
+        '\n  最差 evict ${(worstEvictUs / 1000).toStringAsFixed(2)}ms '
+        '（range 数 $worstEvictRanges）',
+      );
+    }
+    if (worstTakeUs > 0) {
+      b.write(
+        '\n  最差 take  ${(worstTakeUs / 1000).toStringAsFixed(2)}ms '
+        '（块数 $worstTakeKeys）',
+      );
+    }
+    return b.toString();
+  }
+
+  /// 单行摘要：写入请求日志，便于和 [agg] 并排看。
+  static String summaryLine() {
+    if (evictCalls + takeCalls == 0) return '';
+    final a = _avg(addUs, addCalls).toStringAsFixed(3);
+    final e = _avg(evictUs, evictCalls).toStringAsFixed(3);
+    final t = _avg(takeUs, takeCalls).toStringAsFixed(3);
+    return '记账 add=${a}ms/$addCalls次 '
+        'evict=${e}ms/$evictCalls次 '
+        'take=${t}ms/$takeCalls次';
+  }
+}
+
 /// 已缓存的连续段集合。刻意保持"按 offset 升序、两两不重叠且不相邻合并"的不变式，
 /// 这样求缺口、求连续末尾都只是线性扫描。
 class ByteBufferIndex {
@@ -166,11 +258,25 @@ class ByteBufferIndex {
 
   int get cachedBytes => _ranges.fold(0, (sum, r) => sum + r.length);
 
-  bool has(int offset) => _ranges.any((r) => r.contains(offset));
+  /// 线性扫描（微基准插桩）：range 数量随缓存增长，调用点可能在高频路径上。
+  bool has(int offset) {
+    if (!CdnProxyProfiler.enabled) {
+      return _ranges.any((r) => r.contains(offset));
+    }
+    final sw = Stopwatch()..start();
+    final hit = _ranges.any((r) => r.contains(offset));
+    sw.stop();
+    CdnProxyProfiler.hasCalls++;
+    CdnProxyProfiler.hasUs += sw.elapsedMicroseconds;
+    return hit;
+  }
 
   /// 记录"这段字节有了"，并做合并与裁剪。
+  ///
+  /// 微基准插桩：内部全量重建 range 列表，是每次写入的固定成本（见 [CdnProxyProfiler]）。
   void add(ByteRange range) {
     if (range.length <= 0) return;
+    final sw = CdnProxyProfiler.enabled ? (Stopwatch()..start()) : null;
     final merged = <ByteRange>[];
     var current = range;
     var inserted = false;
@@ -196,6 +302,11 @@ class ByteBufferIndex {
       ..clear()
       ..addAll(merged);
     _evict();
+    if (sw != null) {
+      sw.stop();
+      CdnProxyProfiler.addCalls++;
+      CdnProxyProfiler.addUs += sw.elapsedMicroseconds;
+    }
   }
 
   /// 从 [from] 开始连续可用的最后一个字节位置；[from] 本身没缓存则返回 from-1。
@@ -231,45 +342,69 @@ class ByteBufferIndex {
 
   /// 超出上限时，按"离 [center] 的距离"从远到近丢，直到降到上限以内。
   /// 最坏情况会丢到只剩一段——这没关系：数据本来就是可重取的。
+  ///
+  /// 微基准插桩：注意 `cachedBytes` 在本方法里被调用多次，而它自身是 O(n) 求和；
+  /// 加上循环内的 `dropped.contains` 与全量排序，这是 O(n²) 量级的热点。
+  ///
+  /// 计数语义：只统计**真的丢掉了数据**的调用。未超限的提前返回不计入，
+  /// 否则 `evictCalls` 会等于 add 次数，报告里那一行就没法用来判断"是否在丢数据"。
   void _evict() {
-    if (cachedBytes <= limit) return;
+    final sw = CdnProxyProfiler.enabled ? (Stopwatch()..start()) : null;
+    final rangesBefore = _ranges.length;
+    var droppedAny = false;
+    try {
+      if (cachedBytes <= limit) return;
 
-    int distance(ByteRange r) {
-      if (r.contains(center)) return 0;
-      return r.start > center ? r.start - center : center - r.end;
-    }
-
-    // 远的先丢，直到剩下的不超过上限
-    final ordered = [..._ranges]..sort((a, b) => distance(b).compareTo(distance(a)));
-    var remaining = cachedBytes;
-    final dropped = <ByteRange>{};
-    for (final r in ordered) {
-      if (remaining <= limit) break;
-      dropped.add(r);
-      remaining -= r.length;
-    }
-    if (dropped.isEmpty) return;
-
-    // 横跨 center 的那段不整段丢，改成只保留 center 两侧各一半配额
-    final kept = <ByteRange>[];
-    for (final r in _ranges) {
-      if (!dropped.contains(r)) {
-        kept.add(r);
-        continue;
+      int distance(ByteRange r) {
+        if (r.contains(center)) return 0;
+        return r.start > center ? r.start - center : center - r.end;
       }
-      if (r.contains(center)) {
-        // 闭区间 [center-half, center+half] 的长度是 2*half+1，所以两侧各留
-        // half-1 才能保证总长 <= limit。
-        final half = (limit ~/ 2) - 1;
-        if (half < 0) continue;
-        final s = center - half < r.start ? r.start : center - half;
-        final e = center + half > r.end ? r.end : center + half;
-        kept.add(ByteRange(s, e));
+
+      // 远的先丢，直到剩下的不超过上限
+      final ordered = [..._ranges]
+        ..sort((a, b) => distance(b).compareTo(distance(a)));
+      var remaining = cachedBytes;
+      final dropped = <ByteRange>{};
+      for (final r in ordered) {
+        if (remaining <= limit) break;
+        dropped.add(r);
+        remaining -= r.length;
+      }
+      if (dropped.isEmpty) return;
+
+      // 横跨 center 的那段不整段丢，改成只保留 center 两侧各一半配额
+      final kept = <ByteRange>[];
+      for (final r in _ranges) {
+        if (!dropped.contains(r)) {
+          kept.add(r);
+          continue;
+        }
+        if (r.contains(center)) {
+          // 闭区间 [center-half, center+half] 的长度是 2*half+1，所以两侧各留
+          // half-1 才能保证总长 <= limit。
+          final half = (limit ~/ 2) - 1;
+          if (half < 0) continue;
+          final s = center - half < r.start ? r.start : center - half;
+          final e = center + half > r.end ? r.end : center + half;
+          kept.add(ByteRange(s, e));
+        }
+      }
+      _ranges
+        ..clear()
+        ..addAll(kept);
+      droppedAny = true;
+    } finally {
+      if (sw != null && droppedAny) {
+        sw.stop();
+        final us = sw.elapsedMicroseconds;
+        CdnProxyProfiler.evictCalls++;
+        CdnProxyProfiler.evictUs += us;
+        if (us > CdnProxyProfiler.worstEvictUs) {
+          CdnProxyProfiler.worstEvictUs = us;
+          CdnProxyProfiler.worstEvictRanges = rangesBefore;
+        }
       }
     }
-    _ranges
-      ..clear()
-      ..addAll(kept);
   }
 
   void clear() {
