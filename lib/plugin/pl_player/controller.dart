@@ -1073,6 +1073,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     ];
     // 播放器侧状态采样（仅在开启 CDN 调试日志时生效）
     _startCdnSampler();
+    // 解码器侧采样：4K 卡顿的最后一块拼图（硬解是否真的生效、有没有在丢帧）
+    _startDecoderSampler();
   }
 
   Timer? _cdnSampler;
@@ -1136,6 +1138,78 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         );
       } catch (_) {}
     });
+  }
+
+  Timer? _decoderSampler;
+
+  /// 每 4 秒问一次 mpv：**实际生效的解码器是什么、有没有在丢帧**。
+  ///
+  /// 为什么一定要问 mpv 而不是看设置项：设置里 `hwdec=auto` 只表示"允许自动选"，
+  /// 但 iOS 上 VideoToolbox 对某些编码/分辨率组合会拒绝，mpv 会**静默回退到软解**，
+  /// UI 上完全看不出来。`hwdec-current` 才是真相，而软解 4K 必卡。
+  ///
+  /// 取属性走 dynamic：`getProperty` 只定义在 native 实现的 `NativePlayer` 上，
+  /// 不在 `Player` 抽象接口里（上游有意不公开），所以这里用动态派发，
+  /// 平台实现没有该方法时静默跳过——绝不能让诊断功能把播放搞崩。
+  void _startDecoderSampler() {
+    if (!CdnDebugLog.enabled) return;
+    _decoderSampler?.cancel();
+    _decoderSampler = Timer.periodic(const Duration(seconds: 4), (_) {
+      if (!CdnDebugLog.enabled) return;
+      final p = _videoPlayerController;
+      if (p == null) return;
+      try {
+        String? prop(String name) {
+          try {
+            final v = (p as dynamic).getProperty(name);
+            if (v is! String) return null;
+            final t = v.trim();
+            return t.isEmpty ? null : t;
+          } catch (_) {
+            return null;
+          }
+        }
+
+        double? numProp(String name) =>
+            double.tryParse(prop(name) ?? '');
+
+        final load = <String, double>{};
+        for (final k in const [
+          'video-decoder-frame-drop-count',
+          'video-decoder-avcodec-load',
+          'video-decoder-videotoolbox-load',
+        ]) {
+          final v = numProp(k);
+          if (v != null) load[k] = v;
+        }
+
+        CdnDebugLog.decoderSample(
+          CdnDecoderStats(
+            at: DateTime.now(),
+            hwdecCurrent: prop('hwdec-current'),
+            codec: prop('video-codec'),
+            width: prop('width'),
+            height: prop('height'),
+            containerFps: numProp('container-fps'),
+            estimatedVfFps: numProp('estimated-vf-fps'),
+            // 丢帧有两个来源，取较大者：mpv 自己的 frame-drop-count，
+            // 以及解码器上报的 frame-drop-count（前者不含解码器内部丢弃）
+            droppedFrames: _maxInt(
+              int.tryParse(prop('frame-drop-count') ?? ''),
+              load['video-decoder-frame-drop-count']?.toInt(),
+            ),
+            decoderLoad: load['video-decoder-avcodec-load'] ??
+                load['video-decoder-videotoolbox-load'],
+          ),
+        );
+      } catch (_) {}
+    });
+  }
+
+  static int? _maxInt(int? a, int? b) {
+    if (a == null) return b;
+    if (b == null) return a;
+    return a > b ? a : b;
   }
 
   /// 移除事件监听
@@ -1664,6 +1738,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _timer?.cancel();
     _cdnSampler?.cancel();
     _cdnSampler = null;
+    _decoderSampler?.cancel();
+    _decoderSampler = null;
     // 播放页销毁：释放本地代理的引用（没有引用时它会自己停掉，省电、让出端口）
     if (CdnProxyService.instance.isRunning) {
       unawaited(CdnProxyService.instance.release());

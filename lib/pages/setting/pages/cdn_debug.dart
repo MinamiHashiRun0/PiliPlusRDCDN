@@ -155,6 +155,39 @@ class _CdnDebugPageState extends State<CdnDebugPage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  Text(
+                    '解码器（回答"4K 为什么卡"）',
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: scheme.primary,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  SelectableText(
+                    CdnDebugLog.decoderSummary(),
+                    style: const TextStyle(
+                      fontSize: 11,
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    '怎么读：设置里选的是「允许自动选解码器」，但 mpv 可能静默回退到软解，'
+                    'UI 上看不出来——hwdec 显示 no 就是软解，iOS 上软解 4K 必卡。'
+                    'dropped 一直涨 = 解不过来；load 长期 >90% = 解码线程饱和。',
+                    style: TextStyle(fontSize: 12, color: scheme.outline),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
                   Row(
                     children: [
                       Expanded(

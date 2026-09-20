@@ -158,6 +158,76 @@ class CdnPlayerSample {
   }
 }
 
+/// 解码器侧的一次采样：**回答"4K 卡顿是解码器的问题吗"**。
+///
+/// 为什么要单独立一类：网络侧已经量到 92–235 Mbps、缓冲垫也够，但 4K 依旧卡。
+/// 剩下的嫌疑只有解码/渲染，而"到底走的硬解还是软解、是不是在丢帧、解码器有多忙"
+/// 这三项以前完全看不到。mpv 自己知道这些，只是没人去问：
+///   * [hwdecCurrent] —— `hwdec-current`，**实际生效**的解码器；`no` 就是软解
+///   * [droppedFrames] —— `frame-drop-count`，一直涨说明解不过来
+///   * [decoderLoad]   —— `video-decoder-...-load`，>0.9 说明解码线程已饱和
+class CdnDecoderStats {
+  const CdnDecoderStats({
+    required this.at,
+    this.hwdecCurrent,
+    this.codec,
+    this.width,
+    this.height,
+    this.fps,
+    this.droppedFrames,
+    this.decoderLoad,
+    this.estimatedVfFps,
+    this.containerFps,
+  });
+
+  final DateTime at;
+
+  /// 实际生效的硬解方式。`no`/空 = 软解（iOS 上软解 4K 必卡）。
+  final String? hwdecCurrent;
+  final String? codec;
+  final String? width;
+  final String? height;
+  final String? fps;
+
+  /// 累计丢帧数（只增不减，看增量）。
+  final int? droppedFrames;
+
+  /// 解码器占用（mpv 属性里的 "load" 后缀项）。
+  final double? decoderLoad;
+
+  /// mpv 估算的实际渲染帧率。
+  final double? estimatedVfFps;
+  final double? containerFps;
+
+  bool get isSoftDecode {
+    final s = hwdecCurrent?.trim().toLowerCase();
+    return s == null || s.isEmpty || s == 'no' || s == 'none';
+  }
+
+  String toLine() {
+    final b = StringBuffer()
+      ..write('[dec] ')
+      ..write(CdnRequestRecord._ts(at));
+    if (codec != null) b.write(' codec=$codec');
+    if (width != null && height != null) b.write(' ${width}x$height');
+    if (containerFps != null) {
+      b.write(' fps=${containerFps!.toStringAsFixed(2)}');
+    }
+    b.write(
+      ' hwdec=${hwdecCurrent == null || hwdecCurrent!.isEmpty ? '?' : hwdecCurrent}',
+    );
+    if (isSoftDecode) b.write('  ← 软解！');
+    if (decoderLoad != null) {
+      b.write(' load=${(decoderLoad! * 100).toStringAsFixed(0)}%');
+    }
+    if (estimatedVfFps != null) {
+      b.write(' vfFps=${estimatedVfFps!.toStringAsFixed(1)}');
+    }
+    if (droppedFrames != null) b.write(' dropped=$droppedFrames');
+    return b.toString();
+  }
+}
+
 abstract final class CdnDebugLog {
   static const int _maxLines = 400;
   static final List<String> _lines = [];
@@ -288,11 +358,40 @@ abstract final class CdnDebugLog {
   static final List<CdnPlayerSample> _samples = [];
   static List<CdnPlayerSample> get samples => List.unmodifiable(_samples);
 
+  /// 记录一次解码器采样（与 [sample] 同一个开关）。
+  static void decoderSample(CdnDecoderStats s) {
+    if (!_enabled) return;
+    _decoderSamples.add(s);
+    if (_decoderSamples.length > 60) {
+      _decoderSamples.removeRange(0, _decoderSamples.length - 60);
+    }
+    log(s.toLine());
+  }
+
+  static final List<CdnDecoderStats> _decoderSamples = [];
+  static List<CdnDecoderStats> get decoderSamples =>
+      List.unmodifiable(_decoderSamples);
+
+  /// 解码器摘要：给面板直接用的一句话结论。
+  static String decoderSummary() {
+    if (_decoderSamples.isEmpty) return '暂无解码器采样（需开启调试日志并播放）';
+    final last = _decoderSamples.last;
+    final first = _decoderSamples.first;
+    final dropped = (last.droppedFrames ?? 0) - (first.droppedFrames ?? 0);
+    return '最近一次：${last.codec ?? '?'} '
+        '${last.width ?? '?'}x${last.height ?? '?'} '
+        'hwdec=${last.hwdecCurrent?.isEmpty ?? true ? '?' : last.hwdecCurrent}'
+        '${last.isSoftDecode ? '（软解）' : ''}'
+        '${last.decoderLoad != null ? '  解码占用 ${(last.decoderLoad! * 100).toStringAsFixed(0)}%' : ''}'
+        '\n本次会话丢帧合计：$dropped';
+  }
+
   /// 清空（内存与文件）。
   static Future<void> clear() async {
     _lines.clear();
     _records.clear();
     _samples.clear();
+    _decoderSamples.clear();
     _seq = 0;
     try {
       await _sink?.flush();
