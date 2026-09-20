@@ -104,6 +104,10 @@ abstract final class SettingBoxKey {
 
       /// CDN 调试日志开关（记录每次媒体请求的耗时与吞吐）
       cdnDebugLog = 'cdnDebugLog',
+
+      /// 全程缓冲：把 mpv 的 cache-secs 与 demuxer-max-bytes 抬到"基本不设限"，
+      /// 让它一直往前拉取，而不是缓冲到十几秒就停手
+      bufferWholeVideo = 'bufferWholeVideo',
       horizontalPreview = 'horizontalPreview',
       banWordForReply = 'banWordForReply',
       banWordForZone = 'banWordForZone',

@@ -192,6 +192,14 @@ List<SettingsModel> get videoSettings => [
         '当前：${Pref.bufferSec}s。实际缓冲为二者最小值。对于直播流，该选项无效（此选项即mpv的--cache-secs）',
     onTap: _showBufferSecDialog,
   ),
+  const SwitchModel(
+    title: '全程缓冲',
+    subtitle: '不再限制缓冲时长与大小，让 mpv 一直往前拉取（等价于国内网络下那种长缓冲条）。'
+        '代价：开播后很快把整条视频的流量跑掉，移动网络慎用',
+    leading: Icon(Icons.download_for_offline_outlined),
+    setKey: SettingBoxKey.bufferWholeVideo,
+    defaultVal: false,
+  ),
   NormalModel(
     title: '自动同步',
     leading: const Icon(Icons.sync_rounded),

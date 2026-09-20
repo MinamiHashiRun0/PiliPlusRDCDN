@@ -460,6 +460,19 @@ abstract final class Pref {
   static bool get cdnDebugLog =>
       _setting.get(SettingBoxKey.cdnDebugLog, defaultValue: false);
 
+  /// 全程缓冲。默认关。
+  ///
+  /// 为什么需要它：mpv 的 `demuxer-hysteresis-secs` 决定"缓冲到多少就停止拉取"，
+  /// PiliPlus 把它设成 `cache-secs / 1.5`（默认 16s → 约 10.7s）。所以缓冲只长出一小截
+  /// 是**播放器按设计主动停手**，不是网络供不上——实测同一时刻网络只忙了 0.64s，
+  /// 而请求整体持续 37s。
+  ///
+  /// 打开后把时间线与字节线都抬到基本不设限，mpv 会一直往前拉取。
+  /// 代价：流量会在开播后很快跑满整条视频（移动网络慎用）；mpv 用磁盘做缓存，
+  /// 不再占用同等内存。
+  static bool get bufferWholeVideo =>
+      _setting.get(SettingBoxKey.bufferWholeVideo, defaultValue: false);
+
   static bool get autoUpdate =>
       _setting.get(SettingBoxKey.autoUpdate, defaultValue: true);
 
@@ -843,6 +856,17 @@ abstract final class Pref {
       _setting.get(SettingBoxKey.bufferSec, defaultValue: 16.0);
 
   static Map<String, String> initBuffer([double playbackSpeed = 1.0]) {
+    // 全程缓冲：时间线与字节线都抬到 mpv 实际不会撞到的水平。
+    // 128GiB 是 mpv 文档里推荐的"无限"写法；cache-secs 给 24 小时覆盖长视频。
+    if (bufferWholeVideo) {
+      return {
+        'cache': 'yes',
+        'cache-secs': '86400',
+        'demuxer-hysteresis-secs': '60',
+        'demuxer-max-bytes': '137438953472',
+        'demuxer-max-back-bytes': '137438953472',
+      };
+    }
     final bufSec = Pref.bufferSec * playbackSpeed;
     final bufSiz = (Pref.bufferSize * 0x100000).toStringAsFixed(0);
     return {
