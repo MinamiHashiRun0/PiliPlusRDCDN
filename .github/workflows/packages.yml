@@ -1,0 +1,139 @@
+# 出可上机的包：iOS（macOS runner，未签名 IPA，自签）+ Android（ubuntu runner，APK）。
+#
+# 为什么走 CI：产出 iOS 包必须有 macOS + Xcode，Windows 做不到。这里用 GitHub 免费额度
+# 里的 macOS runner（公开仓库免费；私有仓库按 macOS 倍率扣分钟）。
+#
+# 前置（都很关键）：
+#   1. 本文件必须在**默认分支**（main）上，workflow_dispatch 才会在 Actions 页出现。
+#      push 触发则不受此限（本文件已配 push，推任意分支都会跑）。
+#   2. 仓库 Settings → Actions → General 里允许运行工作流。
+#
+# 产物：
+#   - artifact `PiliPlus-ios-unsigned` → PiliPlus.ipa（未签名，自己签：AltStore /
+#     SideStore / Sideloadly / TrollStore 都能吃；免费 Apple ID 的 provisioning
+#     7 天过期，SideStore 可自动续期。上游 CI 特意对 Frameworks 做 ad-hoc codesign，
+#     那一步就是为 AltStore 准备的，这里保留）。
+#   - artifact `PiliPlus-android` → 按 ABI 拆分的 APK。
+
+name: Build packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_tests:
+        description: '先跑 CDN 相关单测'
+        type: boolean
+        default: true
+      flutter_version:
+        description: 'Flutter 版本（默认 3.47.5，与本机一致）'
+        type: string
+        default: '3.47.5'
+      build_ios:
+        description: '构建 iOS（macOS runner）'
+        type: boolean
+        default: true
+      build_android:
+        description: '构建 Android APK'
+        type: boolean
+        default: true
+  push:
+    # 推分支即构建，省得先合进 main 才能试——CI 的第一次跑通常要迭代几轮
+    branches:
+      - 'feat/**'
+      - 'fix/**'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+
+jobs:
+  ios:
+    name: iOS (unsigned IPA)
+    if: ${{ github.event_name == 'push' || inputs.build_ios }}
+    runs-on: macos-26
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # build.ps1 用 git rev-list --count HEAD 算 versionCode，需要完整历史
+          fetch-depth: 0
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ inputs.flutter_version || '3.47.5' }}
+          cache: true
+
+      - name: Prepare (版本约束 / 依赖 / patch)
+        shell: pwsh
+        run: tool/ci_prepare.ps1 iOS
+
+      - name: Run CDN unit tests
+        if: ${{ github.event_name == 'push' || inputs.run_tests }}
+        run: flutter test test/services/cdn/
+
+      - name: Build IPA
+        run: |
+          flutter build ios --release --no-codesign \
+            --dart-define-from-file=pili_release.json --no-pub
+          ln -sf ./build/ios/iphoneos Payload
+          # AltStore 需要 frameworks 有签名（ad-hoc 即可）
+          find Payload/Runner.app/Frameworks -type d -name "*.framework" \
+            -exec codesign --force --sign - --preserve-metadata=identifier,entitlements {} \;
+          zip -r9 PiliPlus.ipa Payload/Runner.app
+          ls -lh PiliPlus.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: PiliPlus-ios-unsigned
+          path: PiliPlus.ipa
+          if-no-files-found: error
+
+  android:
+    name: Android (APK)
+    if: ${{ github.event_name == 'push' || inputs.build_android }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ inputs.flutter_version || '3.47.5' }}
+          cache: true
+
+      - name: Prepare (版本约束 / 依赖 / patch)
+        shell: pwsh
+        run: tool/ci_prepare.ps1 android
+
+      - name: Run CDN unit tests
+        if: ${{ github.event_name == 'push' || inputs.run_tests }}
+        run: flutter test test/services/cdn/
+
+      - name: Build APK
+        run: |
+          flutter build apk --release --split-per-abi \
+            --dart-define-from-file=pili_release.json --no-pub
+          ls -lh build/app/outputs/flutter-apk/
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: PiliPlus-android
+          path: build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error

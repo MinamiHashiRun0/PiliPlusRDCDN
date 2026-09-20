@@ -1,4 +1,4 @@
-# iOS 打包的预处理：让 patch.ps1 在任意环境都能跑通。
+# 打包前的预处理：让 patch.ps1 在任意环境（含 CI runner）都能跑通。
 #
 # 为什么需要它：
 #   patch.ps1 用 `git apply` 往两处打补丁——Flutter SDK 源码，以及 pub cache 里的
@@ -12,7 +12,12 @@
 # 校验 flutter 约束的上限，本机/CI 用的 3.47.5 会被直接拒掉。这里统一放宽成 >=3.47.4。
 #
 # 用法（在仓库根目录）：
-#   pwsh -File tool/ci_prepare_ios.ps1
+#   pwsh -File tool/ci_prepare.ps1 [iOS|android|macos|linux|windows]
+#   不给平台参数时按 iOS 处理。
+
+param(
+    [string]$Platform = 'iOS'
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -77,7 +82,9 @@ if (-not (Test-Path $env:GITHUB_ENV)) { New-Item -ItemType File -Path $env:GITHU
 if ($LASTEXITCODE -ne 0) { throw "build.ps1 失败（$LASTEXITCODE）" }
 
 # ---- 5) 打补丁 ---------------------------------------------------------------
-& (Join-Path $root 'lib/scripts/patch.ps1') iOS
-if ($LASTEXITCODE -ne 0) { throw "patch.ps1 失败（$LASTEXITCODE）" }
+# 平台参数直接透给 patch.ps1：它按 iOS / android / macos / linux / windows 选不同的
+# 补丁集（iOS 会额外打 geetest_ios 与 bottom_sheet_ios_piliplus）。
+& (Join-Path $root 'lib/scripts/patch.ps1') $Platform
+if ($LASTEXITCODE -ne 0) { throw "patch.ps1 $Platform 失败（$LASTEXITCODE）" }
 
-Write-Host 'iOS 预处理完成。'
+Write-Host "$Platform 预处理完成。"
