@@ -109,18 +109,32 @@ Future<void> main(List<String> args) async {
   );
   final probe = CdnProbe(config: config);
 
+  // 整个探测共用一个客户端：复用它才能 keep-alive，避免每个候选都重做 TCP+TLS 握手
+  // （跨境握手 2–5 秒，21 个候选白扔一分钟）。
+  final probeClient = HttpClient()
+    ..connectionTimeout = config.connectTimeout
+    ..maxConnectionsPerHost = opts.connections + 2
+    ..userAgent = _ua;
+
   final results = <CdnProbeResult>[];
   final sw = Stopwatch()..start();
-  for (final candidate in candidates) {
-    stdout.write(
-      '  ${candidate.name.padRight(12)} ${candidate.region.name.padRight(9)} ',
-    );
-    await stdout.flush();
-    final result = opts.parallel
-        ? await probe.measure(candidate, sampleUrl: sampleUrl)
-        : await _measureSingleOnly(probe, candidate, sampleUrl);
-    results.add(result);
-    stdout.writeln(_line(result));
+  try {
+    for (final candidate in candidates) {
+      stdout.write(
+        '  ${candidate.name.padRight(12)} ${candidate.region.name.padRight(9)} ',
+      );
+      await stdout.flush();
+      final result = await probe.measure(
+        candidate,
+        sampleUrl: sampleUrl,
+        withParallel: opts.parallel,
+        client: probeClient,
+      );
+      results.add(result);
+      stdout.writeln(_line(result));
+    }
+  } finally {
+    probeClient.close(force: true);
   }
   sw.stop();
 
@@ -172,13 +186,6 @@ Future<void> main(List<String> args) async {
     ..writeln('')
     ..writeln('用时 ${sw.elapsed.inSeconds}s');
 }
-
-/// `--no-parallel` 时只跑单连接那一轮，省流量。
-Future<CdnProbeResult> _measureSingleOnly(
-  CdnProbe probe,
-  CdnCandidate candidate,
-  String sampleUrl,
-) => probe.measure(candidate, sampleUrl: sampleUrl, withParallel: false);
 
 void _printDiagnosis(List<CdnProbeResult> results) {
   final pathBound = <CdnProbeResult>[];

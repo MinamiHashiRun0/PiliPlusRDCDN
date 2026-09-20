@@ -97,8 +97,6 @@ abstract final class CdnAutoPicker {
         results,
         sampleUrl: sampleUrl,
         videoKey: videoKey ?? Uri.parse(sampleUrl).path,
-        // 实测 08c 单连接最强，作为"一个都没测出来时"的兜底；有排名时不干预
-        preferredHost: kPreferredCdnHost,
       );
       saveReport(report);
       return report;

@@ -9,6 +9,7 @@
 
 import 'dart:async';
 
+import 'package:PiliPlus/services/cdn/cdn_debug_log.dart';
 import 'package:PiliPlus/services/cdn/cdn_proxy.dart';
 import 'package:PiliPlus/utils/platform_utils.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
@@ -65,6 +66,11 @@ class CdnProxyService {
       await proxy.start();
       _proxy = proxy;
       _lastError = null;
+      CdnDebugLog.marker(
+        '代理启动 :${proxy.port} · 并发 $connections 条 · 缓冲上限 '
+        '${bufferLimit ~/ (1024 * 1024)}MB/流 · 预取 '
+        '${proxy.prefetchAhead ~/ (1024 * 1024)}MB',
+      );
       return proxy;
     } catch (e) {
       _lastError = '$e';
@@ -77,7 +83,14 @@ class CdnProxyService {
   ///
   /// 未开启、或启动失败时**原样返回**——这是刻意的：宁可没加速，也不能播不了。
   Future<String> rewrite(String upstreamUrl) async {
-    if (!enabled) return upstreamUrl;
+    // 每次开播都记一次"开关当前处于什么状态"，这样日志自带开/关的分界，
+    // 不用靠猜哪一段是开着代理跑的。
+    final on = enabled;
+    if (_lastLoggedEnabled != on) {
+      _lastLoggedEnabled = on;
+      CdnDebugLog.marker('代理开关 = ${on ? '开' : '关'}');
+    }
+    if (!on) return upstreamUrl;
     if (!upstreamUrl.startsWith('http')) return upstreamUrl;
     final proxy = await ensureStarted();
     if (proxy == null) return upstreamUrl;
@@ -89,6 +102,8 @@ class CdnProxyService {
       return upstreamUrl;
     }
   }
+
+  bool? _lastLoggedEnabled;
 
   /// 播放页销毁时调用，等到没有引用就停掉代理（省电、释放端口）。
   Future<void> release() async {
@@ -102,6 +117,7 @@ class CdnProxyService {
     final p = _proxy;
     _proxy = null;
     _refs = 0;
+    if (p != null) CdnDebugLog.marker('代理停止');
     try {
       await p?.stop();
     } catch (_) {}

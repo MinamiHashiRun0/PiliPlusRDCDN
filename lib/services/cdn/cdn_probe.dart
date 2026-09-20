@@ -110,6 +110,7 @@ class CdnProbeResult {
     this.connections = 1,
     this.partial = false,
     this.failure,
+    this.errorDetail,
   });
 
   final String name;
@@ -131,6 +132,9 @@ class CdnProbeResult {
   /// 服务端忽略了 Range，只拿到了部分字节：吞吐是下限，标记出来。
   final bool partial;
   final CdnProbeFailure? failure;
+
+  /// 失败的短说明（超时 / 连接重置 / DNS 失败 …）。只给状态码不够排查。
+  final String? errorDetail;
 
   bool get ok => failure == null && singleMbps != null;
 
@@ -272,23 +276,14 @@ class CdnProbeReport {
   }
 }
 
-/// 默认偏好的节点。
-///
-/// 实测依据（PC 端、跨境到大陆）：`upos-sz-mirror08c`（华为云**融合** CDN）的单连接吞吐
-/// 是所有候选里最高的（24.5 Mbps，同批 hw 系 21–23、ali 系 13–15），而播放器只吃单连接。
-/// 用户侧观察一致：24MB 缓冲能稳定领先播放进度不缩水。融合 CDN 由多家云聚合调度，
-/// 本身不是单一厂商节点，所以"融合反而更快"是合理的。
-///
-/// 注意这只是**偏好**而不是硬编码：一旦有实测排名，排名里更快的节点仍会顶掉它——
-/// 把一个节点钉死成长期默认，等于又把"按实测选"这件事取消了。
-const String kPreferredCdnHost = 'upos-sz-mirror08c.bilivideo.com';
-
 class CdnProbeConfig {
   const CdnProbeConfig({
     this.singleBytes = 4 * 1024 * 1024,
     this.parallelConnections = 8,
     this.parallelBytesPerConn = 512 * 1024,
-    this.connectTimeout = const Duration(seconds: 6),
+    // 10 秒而不是 6 秒：跨境 TLS 握手常要 2–5 秒，6 秒在并发下会大面积误判为失败
+    // （实测踩过：CDN 设置面板的测速全部变成 `---`）。
+    this.connectTimeout = const Duration(seconds: 10),
     this.readTimeout = const Duration(seconds: 15),
     this.minBytesRatio = 0.98,
     this.rankTtlMs = 6 * 60 * 60 * 1000,
@@ -343,10 +338,15 @@ class CdnProbe {
   /// 探测一个 host。失败不抛异常，统一落在 [CdnProbeResult.failure]。
   ///
   /// [withParallel] 为 false 时只跑单连接那一轮（CLI 的 `--no-parallel` 用它省流量）。
+  ///
+  /// [client] 强烈建议由调用方传入并复用：实测踩过坑——每次探测都新建 `HttpClient`
+  /// 会让每条探测重做一次 TCP+TLS 握手，跨境握手慢，6 条并发一起抢就会大面积超时，
+  /// 面板上表现为"测速全部失败"。复用后连接可 keep-alive，问题消失。
   Future<CdnProbeResult> measure(
     CdnCandidate candidate, {
     required String sampleUrl,
     bool withParallel = true,
+    HttpClient? client,
   }) async {
     final probeUrl = buildProbeUrl(sampleUrl, candidate.host);
     if (probeUrl == null) {
@@ -358,19 +358,26 @@ class CdnProbe {
       );
     }
 
+    // 没传就临时建一个，用完即关（单次调用场景仍可用，但别在高并发里这样用）
+    final owned = client == null;
+    final http = client ?? _newClient(1);
+
     final single = await _measure(
+      http,
       probeUrl,
       connections: 1,
       bytesPerConn: config.singleBytes,
     );
 
     if (single.failure != null) {
+      if (owned) http.close(force: true);
       return CdnProbeResult(
         name: candidate.name,
         host: candidate.host,
         region: candidate.region,
         statusCode: single.statusCode,
         failure: single.failure,
+        errorDetail: single.errorDetail,
       );
     }
 
@@ -378,11 +385,13 @@ class CdnProbe {
     if (withParallel &&
         (single.mbps ?? 0) >= config.skipParallelWhenSingleBelowMbps) {
       parallel = await _measure(
+        http,
         probeUrl,
         connections: config.parallelConnections,
         bytesPerConn: config.parallelBytesPerConn,
       );
     }
+    if (owned) http.close(force: true);
 
     return CdnProbeResult(
       name: candidate.name,
@@ -396,20 +405,30 @@ class CdnProbe {
       connections: parallel == null ? 1 : config.parallelConnections,
       partial: single.partial || (parallel?.partial ?? false),
       parallelMbps: parallel?.failure == null ? parallel?.mbps : null,
+      errorDetail: parallel?.errorDetail ?? single.errorDetail,
     );
   }
 
   /// 依次探测多个 host；[onResult] 用于边测边刷 UI / 边打印。
+  ///
+  /// [client] 会透传给每次 [measure]；串行场景共用一条连接，避免反复握手。
   Future<List<CdnProbeResult>> measureAll(
     List<CdnCandidate> candidates, {
     required String sampleUrl,
     void Function(CdnProbeResult result)? onResult,
     bool Function()? shouldStop,
+    HttpClient? client,
+    bool withParallel = true,
   }) async {
     final out = <CdnProbeResult>[];
     for (final candidate in candidates) {
       if (shouldStop?.call() ?? false) break;
-      final result = await measure(candidate, sampleUrl: sampleUrl);
+      final result = await measure(
+        candidate,
+        sampleUrl: sampleUrl,
+        client: client,
+        withParallel: withParallel,
+      );
       out.add(result);
       onResult?.call(result);
     }
@@ -420,13 +439,11 @@ class CdnProbe {
   /// 1. 未被剔除的、吞吐达标的进排名
   /// 2. 吞吐优先，同速看延迟
   /// 3. hkFirst 时先取第一个港澳台/海外节点（没有就回落全场第一）
-  /// 4. [preferredHost] 在没有任何可用排名时兜底；排名可用时**不干预**排名结果
   CdnProbeReport rank(
     List<CdnProbeResult> results, {
     required String sampleUrl,
     String? videoKey,
     String? noPickNote,
-    String? preferredHost,
   }) {
     final usable = [
       for (final e in results)
@@ -441,17 +458,6 @@ class CdnProbe {
     if (config.hkFirst) {
       for (final e in usable) {
         if (e.region == CdnRegion.overseas) {
-          pick = e;
-          break;
-        }
-      }
-    }
-
-    // 兜底偏好：只在"一个可用候选都没有"时出手。有排名时不动排名结果——
-    // 否则就等于把测速又变成摆设。
-    if (pick == null && preferredHost != null) {
-      for (final e in results) {
-        if (e.host == preferredHost) {
           pick = e;
           break;
         }
@@ -484,16 +490,29 @@ class CdnProbe {
     ).toString();
   }
 
+  /// 新建一个探测用客户端。
+  ///
+  /// `connectionTimeout` 给 10 秒而不是 6 秒：跨境 TLS 握手经常 2–5 秒，
+  /// 6 秒在并发下会大面积误判为失败（实测踩过：面板测速全变 `---`）。
+  HttpClient _newClient(int connections) => HttpClient()
+    ..connectionTimeout = config.connectTimeout
+    ..idleTimeout = const Duration(seconds: 15)
+    // 允许真正的并发：不设上限会被默认值挡住。
+    ..maxConnectionsPerHost = connections < 4 ? 4 : connections + 2
+    ..userAgent = _userAgent;
+
   Future<_ProbeSample> _measure(
+    HttpClient client,
     String url, {
     required int connections,
     required int bytesPerConn,
   }) async {
-    final client = HttpClient()
-      ..connectionTimeout = config.connectTimeout
-      // 允许真正的并发：不设上限会被默认值挡住。
-      ..maxConnectionsPerHost = connections < 4 ? 4 : connections + 2
-      ..userAgent = _userAgent;
+    // 并发轮可能需要的连接数比单连接轮多，临时抬高上限（同一个客户端复用连接池）
+    final need = connections < 4 ? 4 : connections + 2;
+    final current = client.maxConnectionsPerHost;
+    if (current == null || current < need) {
+      client.maxConnectionsPerHost = need;
+    }
     final sw = Stopwatch()..start();
     var received = 0;
     var wanted = 0;
@@ -501,6 +520,7 @@ class CdnProbe {
     int? ttfbMs;
     var partial = false;
     CdnProbeFailure? failure;
+    String? errorDetail;
 
     try {
       final tasks = <Future<_OneShot>>[];
@@ -517,6 +537,7 @@ class CdnProbe {
         ttfbMs ??= shot.ttfbMs;
         if (shot.failure != null) {
           failure ??= shot.failure;
+          errorDetail ??= shot.errorDetail;
           partial = true;
           continue;
         }
@@ -525,9 +546,9 @@ class CdnProbe {
       }
     } catch (e) {
       failure ??= _classify(e);
-    } finally {
-      client.close(force: true);
+      errorDetail ??= _describe(e);
     }
+    // 注意：不在这里 close —— 客户端由调用方持有，跨探测复用连接。
 
     sw.stop();
 
@@ -553,6 +574,7 @@ class CdnProbe {
       seconds: seconds,
       partial: partial,
       failure: failure,
+      errorDetail: errorDetail,
     );
   }
 
@@ -619,6 +641,7 @@ class CdnProbe {
         bytes: 0,
         ttfbMs: sw.elapsedMilliseconds,
         failure: CdnProbeFailure.timeout,
+        errorDetail: '超时(${config.readTimeout.inSeconds}s)',
       );
     } catch (e) {
       return _OneShot(
@@ -626,8 +649,30 @@ class CdnProbe {
         bytes: 0,
         ttfbMs: sw.elapsedMilliseconds,
         failure: _classify(e),
+        errorDetail: _describe(e),
       );
     }
+  }
+
+  /// 把异常压成一句能显示在面板上的短说明。
+  ///
+  /// 之前所有连接失败都归成「连接失败」，用户只看到 `---`，没法区分是
+  /// DNS、握手超时、连接被重置还是对端拒绝 —— 排查时这点信息很关键。
+  static String _describe(Object e) {
+    if (e is TimeoutException) return '超时';
+    if (e is SocketException) {
+      final msg = e.message;
+      if (e.osError?.errorCode == 60 || msg.contains('timed out')) return '连接超时';
+      if (msg.contains('reset') || e.osError?.errorCode == 54) return '连接重置';
+      if (msg.contains('Failed host lookup') ||
+          msg.contains('nodename nor servname')) {
+        return 'DNS 失败';
+      }
+      return '网络错误${e.osError == null ? '' : '(${e.osError!.errorCode})'}';
+    }
+    if (e is HandshakeException) return 'TLS 握手失败';
+    if (e is HttpException) return '协议错误';
+    return '${e.runtimeType}';
   }
 
   /// 非 200/206 一律算这个节点拿不到资源。403/404/410/416 与 959（B 站 CDN 自家码）
@@ -653,6 +698,7 @@ class _ProbeSample {
     this.seconds,
     this.partial = false,
     this.failure,
+    this.errorDetail,
   });
 
   final int? statusCode;
@@ -662,6 +708,7 @@ class _ProbeSample {
   final double? seconds;
   final bool partial;
   final CdnProbeFailure? failure;
+  final String? errorDetail;
 }
 
 class _OneShot {
@@ -671,6 +718,7 @@ class _OneShot {
     required this.ttfbMs,
     this.partial = false,
     this.failure,
+    this.errorDetail,
   });
 
   final int? statusCode;
@@ -678,6 +726,7 @@ class _OneShot {
   final int ttfbMs;
   final bool partial;
   final CdnProbeFailure? failure;
+  final String? errorDetail;
 }
 
 String _f(double v) => v.toStringAsFixed(1);

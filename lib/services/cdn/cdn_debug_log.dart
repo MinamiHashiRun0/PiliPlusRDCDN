@@ -25,20 +25,31 @@ class CdnRequestRecord {
     required this.seq,
     required this.at,
     required this.label,
+    required this.host,
     required this.range,
     required this.bytes,
     required this.netMs,
     required this.upstream,
     required this.fallback,
     required this.aborted,
+    this.mbps,
+    this.chunkCount,
+    this.chunkMs,
+    this.chunkFailed,
+    this.concurrency,
     this.note,
   });
 
   final int seq;
   final DateTime at;
   final String label;
+
+  /// 实际命中的上游主机（判断"是不是走了 08c"就看它）。
+  final String host;
   final String range;
   final int bytes;
+
+  /// 整个请求的墙钟时间。**含播放器背压，不能用来算吞吐**。
   final int netMs;
   final int upstream;
 
@@ -47,9 +58,16 @@ class CdnRequestRecord {
 
   /// 是否毁掉过连接。
   final bool aborted;
+
+  /// 逐块聚合吞吐（可信的那个数）。
+  final double? mbps;
+  final int? chunkCount;
+  final int? chunkMs;
+  final int? chunkFailed;
+  final int? concurrency;
   final String? note;
 
-  double get mbps =>
+  double get wallMbps =>
       netMs <= 0 ? 0 : bytes * 8 / 1000000 / (netMs / 1000);
 
   String toLine() {
@@ -58,14 +76,28 @@ class CdnRequestRecord {
       ..write(_ts(at))
       ..write(' ')
       ..write(label)
+      ..write('@')
+      ..write(host)
       ..write(' range=${range.length > 24 ? '${range.substring(0, 24)}…' : range}')
       ..write(' bytes=$bytes')
       ..write(' net=${(netMs / 1000).toStringAsFixed(2)}s')
-      ..write(' speed=${mbps.toStringAsFixed(1)}Mbps')
+      ..write(' wall=${wallMbps.toStringAsFixed(1)}Mbps')
       ..write(' upstream=$upstream');
     if (fallback > 0) b.write(' fallback=$fallback');
     if (aborted) b.write(' ABORTED');
     if (note != null && note!.isNotEmpty) b.write(' note=$note');
+    b.write('\n         ');
+    if (chunkCount == null || chunkCount == 0) {
+      b.write('[agg] 无取块样本（整段命中缓冲或走了直通）');
+    } else {
+      b
+        ..write('[agg] ')
+        ..write('${chunkCount!} 块 × 并发 ${concurrency ?? 1}')
+        ..write('  合计 ${(bytes / 1048576).toStringAsFixed(1)}MiB')
+        ..write(' / ${((chunkMs ?? 0) / 1000).toStringAsFixed(2)}s')
+        ..write(' = ${(mbps ?? 0).toStringAsFixed(1)}Mbps');
+      if ((chunkFailed ?? 0) > 0) b.write('  失败块 ${chunkFailed!}');
+    }
     return b.toString();
   }
 
@@ -132,23 +164,27 @@ abstract final class CdnDebugLog {
         : _records.sublist(_records.length - last);
     if (recent.isEmpty) return '暂无媒体请求记录';
     var bytes = 0;
-    var netMs = 0;
+    var chunkBytes = 0;
+    var chunkMs = 0;
     var upstream = 0;
     var fallback = 0;
     var aborted = 0;
     for (final r in recent) {
       bytes += r.bytes;
-      netMs += r.netMs;
       upstream += r.upstream;
       fallback += r.fallback;
       if (r.aborted) aborted++;
+      // 聚合口径：把各次请求的"块字节/块时间"累加，得到整体上游吞吐
+      if ((r.chunkCount ?? 0) > 0) {
+        chunkBytes += r.bytes;
+        chunkMs += r.chunkMs ?? 0;
+      }
     }
-    final mbps = netMs <= 0 ? 0.0 : bytes * 8 / 1000000 / (netMs / 1000);
+    final aggMbps = chunkMs <= 0 ? 0.0 : chunkBytes * 8 / 1000000 / (chunkMs / 1000);
     return '最近 ${recent.length} 次请求：'
         '共 ${(bytes / 1048576).toStringAsFixed(1)}MiB · '
-        '网络耗时 ${(netMs / 1000).toStringAsFixed(1)}s · '
-        '平均 ${mbps.toStringAsFixed(1)} Mbps · '
-        '上游请求 $upstream · 直通 $fallback · 中断 $aborted';
+        '上游请求 $upstream · 直通 $fallback · 中断 $aborted\n'
+        '上游聚合吞吐（可信）：${aggMbps.toStringAsFixed(1)} Mbps';
   }
 
   static Future<void> _ensureOpen() async {
@@ -170,11 +206,18 @@ abstract final class CdnDebugLog {
       final f = File('${dir.path}/cdn_proxy.log');
       _file = f;
       _sink = f.openWrite(mode: FileMode.append);
-      log('--- 会话开始 ${DateTime.now()} ---');
+      // 文件是追加的，所以"会话开始"每次进程启动都会写一条 —— 靠它给日志分段。
+      log('=== 进程启动 ${DateTime.now()} ===');
     } catch (e) {
       _file = null;
       _sink = null;
     }
+  }
+
+  /// 由代理服务在启动/停止/改配置时调用，让日志自带"什么时候开了什么"。
+  static void marker(String text) {
+    if (!_enabled) return;
+    log('--- $text ---');
   }
 
   /// 清空（内存与文件）。

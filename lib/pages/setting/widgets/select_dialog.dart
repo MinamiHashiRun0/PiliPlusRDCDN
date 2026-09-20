@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show HttpClient;
 
 import 'package:PiliPlus/http/browser_ua.dart';
 import 'package:PiliPlus/http/constants.dart';
@@ -111,7 +112,8 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
   );
 
   /// 同时最多几条探测在飞。原版是串行 21 个节点，最坏 21×15s。
-  static const _probeConcurrency = 6;
+  /// 从 6 降到 4：跨境握手贵，并发太高反而互相抢连接、大面积超时。
+  static const _probeConcurrency = 4;
 
   late final List<_CdnProbeState> _probes;
   late final bool _cdnSpeedTest;
@@ -195,6 +197,13 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
             ),
       ];
 
+      // **整个对话框共用一条 HttpClient**。
+      // 之前每条探测各自 new 一个，等于每次都重做 TCP+TLS 握手；跨境握手常要 2–5 秒，
+      // 6 条并发一起抢就大面积超时，面板上表现为全部 `---`。复用后连接 keep-alive。
+      final client = HttpClient()
+        ..connectionTimeout = _probeConfig.connectTimeout
+        ..maxConnectionsPerHost = _probeConcurrency + 2;
+
       // 原版是串行跑 21 个节点（最坏 21×15s）。这里用固定并发的工作池。
       var next = 0;
       Future<void> worker() async {
@@ -213,6 +222,7 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
             target.candidate,
             sampleUrl: template,
             withParallel: false,
+            client: client,
           );
           if (!mounted) return;
           setState(() {
@@ -220,14 +230,23 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
               ..mbps = result.singleMbps
               ..ttfbMs = result.singleTtfbMs
               ..statusCode = result.statusCode
-              ..failure = result.failure == null ? null : result.verdict;
+              // 失败时带上细分原因（超时/连接重置/DNS 失败…），别再只显示 ---
+              ..failure = result.failure == null
+                  ? null
+                  : (result.errorDetail == null
+                        ? result.verdict
+                        : '${result.verdict} · ${result.errorDetail}');
           });
         }
       }
 
-      await Future.wait([
-        for (var i = 0; i < _probeConcurrency; i++) worker(),
-      ]);
+      try {
+        await Future.wait([
+          for (var i = 0; i < _probeConcurrency; i++) worker(),
+        ]);
+      } finally {
+        client.close(force: true);
+      }
     } catch (e) {
       if (kDebugMode) debugPrint('CDN speed test failed: $e');
     }

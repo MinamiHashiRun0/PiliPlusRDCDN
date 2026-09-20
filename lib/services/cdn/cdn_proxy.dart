@@ -24,19 +24,68 @@ import 'package:PiliPlus/services/cdn/proxy_core.dart';
 export 'package:PiliPlus/services/cdn/proxy_core.dart'
     show ByteRange, RangeRequest, ContentRange, planChunks, ByteBufferIndex;
 
+/// 一次上游取块的样本。**这是唯一可信的吞吐来源**。
+///
+/// 为什么不测量"整个请求耗时"：mpv 缓冲满了就不再读，代理的写操作会被背压卡住，
+/// 那段时间与网络无关。实测踩过：一次 64MiB 请求算出 2.0 Mbps，而视频其实播得好好的。
+/// 逐块计时只覆盖"上游把这段字节发过来"，不含播放器消费时间。
+class _ChunkSample {
+  const _ChunkSample(this.len, this.ms, {this.ok = true});
+
+  final int len;
+  final int ms;
+  final bool ok;
+
+  double get mbps => ms <= 0 ? 0 : len * 8 / 1000000 / (ms / 1000);
+}
+
 /// 一次请求的统计，用于日志与"瓶颈在网络还是在播放器"的判断。
 class _RequestStats {
   int upstream = 0;
   int fallback = 0;
   bool aborted = false;
 
-  /// 花在"从上游取字节"上的时间。
+  /// 花在"从上游取字节"上的时间（含背压，仅供参考，别用它算吞吐）。
   int netMs = 0;
 
   /// 花在"把字节写给 mpv"上的时间。
   int writeMs = 0;
 
+  /// 逐块样本：并发窗口内的块各自计时。
+  final List<_ChunkSample> chunks = [];
+
+  /// 取这批块时实际用了多少条并发。
+  int concurrency = 1;
+
   final Stopwatch total = Stopwatch()..start();
+
+  /// 聚合吞吐：所有块的字节 ÷ 它们整体占用的墙钟时间。
+  ///
+  /// 分母用 `块数 ÷ 并发数 × 平均单块耗时` 近似：k 个块按 c 并发跑，整体时长约为
+  /// (k/c)×平均块时长。这比"耗时求和"（等于串行假设）和"取最长块"都更接近真实。
+  ({int bytes, int ms, double mbps, int count, int failed}) get aggregate {
+    if (chunks.isEmpty) {
+      return (bytes: 0, ms: 0, mbps: 0, count: 0, failed: 0);
+    }
+    var bytes = 0;
+    var sumMs = 0;
+    var failed = 0;
+    for (final c in chunks) {
+      if (!c.ok) failed++;
+      bytes += c.len;
+      sumMs += c.ms;
+    }
+    final avgMs = sumMs / chunks.length;
+    final effective = concurrency < 1 ? 1 : concurrency;
+    final window = (avgMs * chunks.length / effective).ceil();
+    return (
+      bytes: bytes,
+      ms: window,
+      mbps: window <= 0 ? 0.0 : bytes * 8 / 1000000 / (window / 1000),
+      count: chunks.length,
+      failed: failed,
+    );
+  }
 }
 
 /// 播放器侧要引用的媒体。
@@ -282,6 +331,9 @@ class CdnProxy {
   }
 
   /// 把一次请求的统计写进日志。这是判断"瓶颈在网络还是在播放器"的唯一依据。
+  ///
+  /// 注意 `netMs` 含播放器背压（缓冲满了 mpv 就不读，代理写操作被卡住），
+  /// 所以日志里同时给"墙钟折算 wall"和"逐块聚合 agg"两个数——**后者才可信**。
   void _logRequest(
     ProxyTrack track,
     RangeRequest? wanted,
@@ -289,20 +341,27 @@ class CdnProxy {
     int bytes, [
     String? note,
   ]) {
+    final agg = stats.aggregate;
     CdnDebugLog.record(
       CdnRequestRecord(
         seq: CdnDebugLog.nextSeq(),
         at: DateTime.now(),
         label: track.label,
+        host: Uri.tryParse(track.url)?.host ?? '?',
         range: wanted == null
             ? '整段'
             : '${wanted.start ?? ''}-${wanted.end ?? ''}'
                   '${wanted.suffixLength != null ? ' suffix=${wanted.suffixLength}' : ''}',
         bytes: bytes,
-        netMs: stats.netMs,
+        netMs: stats.total.elapsedMilliseconds,
         upstream: stats.upstream,
         fallback: stats.fallback,
         aborted: stats.aborted,
+        mbps: agg.count == 0 ? null : agg.mbps,
+        chunkCount: agg.count,
+        chunkMs: agg.ms,
+        chunkFailed: agg.failed,
+        concurrency: stats.concurrency,
         note: note,
       ),
     );
@@ -379,6 +438,9 @@ class CdnProxy {
       connections: connections,
       perConn: perConn,
     );
+    if (stats != null && chunks.length > stats.concurrency) {
+      stats.concurrency = chunks.length;
+    }
     await Future.wait([
       for (final c in chunks) _fetchChunk(track, c, extra, stats),
     ]);
@@ -416,6 +478,11 @@ class CdnProxy {
         throw HttpException('上游只给了 ${got.length}/${range.length} 字节');
       }
       track.put(range, got.sublist(0, range.length));
+      // 逐块样本：这就是"这条路能跑多快"的直接证据
+      stats?.chunks.add(_ChunkSample(range.length, sw.elapsedMilliseconds));
+    } catch (e) {
+      stats?.chunks.add(_ChunkSample(range.length, sw.elapsedMilliseconds, ok: false));
+      rethrow;
     } finally {
       stats?.netMs += sw.elapsedMilliseconds;
     }
