@@ -130,8 +130,9 @@ Future<void> main(List<String> args) async {
     videoKey: opts.videoKey ?? sampleUrl,
   );
 
-  stdout.writeln('');
-  stdout.writeln('== 排名（吞吐优先，同速看延迟）==');
+  stdout
+    ..writeln('')
+    ..writeln('== 排名（吞吐优先，同速看延迟）==');
   if (report.ranked.isEmpty) {
     stdout.writeln('  全部候选未通过：${report.note}');
   } else {
@@ -144,9 +145,11 @@ Future<void> main(List<String> args) async {
     }
   }
   if (report.pick != null) {
-    stdout.writeln('');
-    stdout.writeln('目标：${report.pick!.host}'
-        '${config.hkFirst ? '（hk-first）' : ''}');
+    stdout
+      ..writeln('')
+      ..writeln(
+        '目标：${report.pick!.host}${config.hkFirst ? '（hk-first）' : ''}',
+      );
     final full = report.ranked.first;
     if (full.host != report.pick!.host) {
       stdout.writeln('全场最快：${full.host} ${_mbps(full.mbps)}');
@@ -160,12 +163,14 @@ Future<void> main(List<String> args) async {
     await file.writeAsString(
       const JsonEncoder.withIndent('  ').convert(report.toJson()),
     );
-    stdout.writeln('');
-    stdout.writeln('报告已写入 ${file.path}');
+    stdout
+      ..writeln('')
+      ..writeln('报告已写入 ${file.path}');
   }
 
-  stdout.writeln('');
-  stdout.writeln('用时 ${sw.elapsed.inSeconds}s');
+  stdout
+    ..writeln('')
+    ..writeln('用时 ${sw.elapsed.inSeconds}s');
 }
 
 /// `--no-parallel` 时只跑单连接那一轮，省流量。
@@ -193,8 +198,9 @@ void _printDiagnosis(List<CdnProbeResult> results) {
     }
   }
 
-  stdout.writeln('');
-  stdout.writeln('== 瓶颈判定 ==');
+  stdout
+    ..writeln('')
+    ..writeln('== 瓶颈判定 ==');
   if (pathBound.isEmpty && nodeBound.isEmpty && anomalous.isEmpty) {
     stdout.writeln('  没有明显异常：单连接基本能吃满，选节点即可。');
     return;

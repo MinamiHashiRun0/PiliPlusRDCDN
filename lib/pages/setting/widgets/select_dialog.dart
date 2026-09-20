@@ -7,6 +7,7 @@ import 'package:PiliPlus/models/common/video/cdn_type.dart';
 import 'package:PiliPlus/models/common/video/video_quality.dart';
 import 'package:PiliPlus/models/common/video/video_type.dart';
 import 'package:PiliPlus/models/video/play/url.dart';
+import 'package:PiliPlus/services/cdn/cdn_probe.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:PiliPlus/utils/video_utils.dart';
 import 'package:dio/dio.dart';
@@ -83,32 +84,57 @@ class CdnSelectDialog extends StatefulWidget {
   State<CdnSelectDialog> createState() => _CdnSelectDialogState();
 }
 
+/// 每条候选的测速状态。label 为 null 表示还没测完。
+class _CdnProbeState {
+  _CdnProbeState(this.service);
+
+  final CDNService service;
+  double? mbps;
+  int? ttfbMs;
+  int? statusCode;
+  String? failure;
+
+  String? get label {
+    final m = mbps;
+    if (m != null) {
+      final ttfb = ttfbMs;
+      return '${m.toStringAsFixed(1)} Mbps${ttfb == null ? '' : ' · ${ttfb}ms'}';
+    }
+    return failure;
+  }
+}
+
 class _CdnSelectDialogState extends State<CdnSelectDialog> {
-  late final List<ValueNotifier<String?>> _cdnResList;
-  late final List<CancelToken?> _tokens;
+  static const _probeConfig = CdnProbeConfig(
+    // 对话框里要快：只测单连接，1MiB 就够区分节点档位
+    singleBytes: 1024 * 1024,
+  );
+
+  /// 同时最多几条探测在飞。原版是串行 21 个节点，最坏 21×15s。
+  static const _probeConcurrency = 6;
+
+  late final List<_CdnProbeState> _probes;
   late final bool _cdnSpeedTest;
+
+  /// 只在需要回落到「内置样本视频」时用它去请求 playurl。
+  Dio? _dio;
 
   @override
   void initState() {
     _cdnSpeedTest = Pref.cdnSpeedTest;
+    _probes = [
+      for (final s in CDNService.values) _CdnProbeState(s),
+    ];
     if (_cdnSpeedTest) {
-      _dio =
-          Dio(
-              BaseOptions(
-                connectTimeout: const Duration(seconds: 15),
-                receiveTimeout: const Duration(seconds: 15),
-              ),
-            )
-            ..options.headers = {
-              'user-agent': BrowserUa.pc,
-              'referer': HttpString.baseUrl,
-            };
-      final length = CDNService.values.length;
-      _cdnResList = List.generate(
-        length,
-        (_) => ValueNotifier<String?>(null),
-      );
-      _tokens = List.generate(length, (_) => CancelToken());
+      _dio = Dio(
+        BaseOptions(
+          connectTimeout: const Duration(seconds: 15),
+          receiveTimeout: const Duration(seconds: 15),
+        ),
+      )..options.headers = {
+        'user-agent': BrowserUa.pc,
+        'referer': HttpString.baseUrl,
+      };
       _startSpeedTest();
     }
     super.initState();
@@ -116,19 +142,21 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
 
   @override
   void dispose() {
-    if (_cdnSpeedTest) {
-      for (final e in _tokens) {
-        e?.cancel();
-      }
-      for (final notifier in _cdnResList) {
-        notifier.dispose();
-      }
-      _dio.close(force: true);
-    }
+    _dio?.close(force: true);
     super.dispose();
   }
 
-  Future<BaseItem> _getSampleUrl() async {
+  /// 拿一条**新鲜的签名媒体地址**当测速模板。优先级：
+  ///   1. 播放页传进来的当前视频（最好）
+  ///   2. VideoUtils.lastSample：最近一次播放时记下的地址（几秒~几分钟前，签名仍有效）
+  ///   3. 内置样本视频：只在两条都没有时才用，需要请求一次 playurl
+  ///
+  /// 为什么要绕这一圈：原版固定用 BV1fK4y1t7hj 当样本，测出来的是"那个视频在这个
+  /// 节点上"的速度；而某个节点有没有**你正在看的那条视频**的资源，是另一回事。
+  Future<String?> _resolveTemplate() async {
+    if (widget.sample?.playUrls.firstOrNull case final url?) return url;
+    if (VideoUtils.lastSample case final url?) return url;
+
     final result = await VideoHttp.videoUrl(
       cid: 196018899,
       bvid: 'BV1fK4y1t7hj',
@@ -136,111 +164,73 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
       tryLook: false,
       videoType: VideoType.ugc,
     );
-    final item = result.dataOrNull?.dash?.video?.first;
-    if (item == null) throw Exception('无法获取视频流');
-    return item;
+    return result.dataOrNull?.dash?.video?.first.playUrls.firstOrNull;
   }
 
   Future<void> _startSpeedTest() async {
     try {
-      final videoItem = widget.sample ?? await _getSampleUrl();
-      await _testAllCdnServices(videoItem);
+      final template = await _resolveTemplate();
+      if (template == null) {
+        if (mounted) {
+          setState(() {
+            for (final p in _probes) {
+              p.failure = '没有可用的测速样本';
+            }
+          });
+        }
+        return;
+      }
+
+      final probe = CdnProbe(config: _probeConfig);
+      final targets = [
+        for (final p in _probes)
+          if (p.service.host case final host?)
+            (
+              state: p,
+              candidate: CdnCandidate(
+                name: p.service.name,
+                host: host,
+                desc: p.service.desc,
+              ),
+            ),
+      ];
+
+      // 原版是串行跑 21 个节点（最坏 21×15s）。这里用固定并发的工作池。
+      var next = 0;
+      Future<void> worker() async {
+        while (mounted) {
+          final index = next++;
+          if (index >= targets.length) return;
+          final target = targets[index];
+          // 模板不合法（连 http(s) 都不是）时不必发请求
+          if (CdnProbe.buildProbeUrl(template, target.candidate.host) == null) {
+            if (mounted) {
+              setState(() => target.state.failure = '样本地址不合法');
+            }
+            continue;
+          }
+          final result = await probe.measure(
+            target.candidate,
+            sampleUrl: template,
+            withParallel: false,
+          );
+          if (!mounted) return;
+          setState(() {
+            target.state
+              ..mbps = result.singleMbps
+              ..ttfbMs = result.singleTtfbMs
+              ..statusCode = result.statusCode
+              ..failure = result.failure == null ? null : result.verdict;
+          });
+        }
+      }
+
+      await Future.wait([
+        for (var i = 0; i < _probeConcurrency; i++) worker(),
+      ]);
     } catch (e) {
       if (kDebugMode) debugPrint('CDN speed test failed: $e');
     }
-  }
-
-  Future<void> _testAllCdnServices(BaseItem videoItem) async {
-    for (final item in CDNService.values) {
-      if (!mounted) break;
-      await _testSingleCdn(item, videoItem);
-    }
-  }
-
-  Future<void> _testSingleCdn(CDNService item, BaseItem videoItem) async {
-    try {
-      final cdnUrl = VideoUtils.getCdnUrl(
-        videoItem.playUrls,
-        defaultCDNService: item,
-      );
-      await _measureDownloadSpeed(cdnUrl, item.index);
-    } catch (e) {
-      _handleSpeedTestError(e, item.index);
-    }
-  }
-
-  late final Dio _dio;
-
-  Future<void> _measureDownloadSpeed(String url, int index) async {
-    const maxSize = 8 * 1024 * 1024;
-    int downloaded = 0;
-
-    final cancelToken = _tokens[index];
-    final start = DateTime.now().microsecondsSinceEpoch;
-
-    void onClose() {
-      cancelToken?.cancel();
-      _tokens[index] = null;
-    }
-
-    await _dio.get(
-      url,
-      cancelToken: cancelToken,
-      onReceiveProgress: (count, total) {
-        if (!mounted) {
-          return;
-        }
-
-        final duration = DateTime.now().microsecondsSinceEpoch - start;
-
-        downloaded = count;
-
-        if (duration > 15000000) {
-          onClose();
-          if (downloaded > 0) {
-            _updateSpeedResult(index, downloaded, duration);
-            downloaded = 0;
-          } else {
-            throw TimeoutException('测速超时');
-          }
-        } else if (downloaded >= maxSize) {
-          onClose();
-          _updateSpeedResult(index, downloaded, duration);
-          downloaded = 0;
-        }
-      },
-    );
-  }
-
-  void _updateSpeedResult(int index, int downloaded, int duration) {
-    final speed = (downloaded / duration).toStringAsPrecision(3);
-    _cdnResList[index].value = '${speed}MB/s';
-  }
-
-  void _handleSpeedTestError(dynamic error, int index) {
-    _tokens
-      ..[index]?.cancel()
-      ..[index] = null;
-    final item = _cdnResList[index];
-    if (item.value != null) return;
-
-    if (kDebugMode) debugPrint('CDN speed test error: $error');
-    if (!mounted) return;
-    String message;
-    if (error is DioException) {
-      final statusCode = error.response?.statusCode;
-      if (statusCode != null && 400 <= statusCode && statusCode < 500) {
-        message = '此视频可能无法替换为该CDN';
-      } else {
-        message = error.toString();
-      }
-    } else {
-      message = error.toString();
-    }
-    if (message.isEmpty) {
-      message = '测速失败';
-    }
-    item.value = message;
   }
 
   @override
@@ -251,17 +241,12 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
       value: VideoUtils.cdnService,
       subtitleBuilder: _cdnSpeedTest
           ? (context, index) {
-              final item = _cdnResList[index];
-              return ValueListenableBuilder(
-                valueListenable: item,
-                builder: (context, value, _) {
-                  return Text(
-                    value ?? '---',
-                    style: const TextStyle(fontSize: 13),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  );
-                },
+              final item = _probes[index];
+              return Text(
+                item.label ?? '---',
+                style: const TextStyle(fontSize: 13),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
               );
             }
           : null,

@@ -124,15 +124,29 @@ abstract final class VideoUtils {
   ///
   /// [lite] 给移动网络/移动端用的小额档：连接数与字节都减半，一轮总流量从约 250MB
   /// 降到约 100MB（21 个候选）。默认 false（Wi-Fi/桌面）。
+  /// 最近一次播放用到的签名媒体地址（只记第一条视频轨）。
+  ///
+  /// 用途：CDN 设置对话框要拿一条**新鲜的签名地址**当测速模板。拿它比固定用内置样本
+  /// 视频准——某个节点有没有你正在看的那条视频的资源，和"那个样本视频"不是一回事。
+  /// 只在内存里，不进存储：签名地址是带期限的凭据，没必要写盘。
+  static String? get lastSample => _lastSample;
+  static String? _lastSample;
+
+  /// 注释见上；由播放流程调用。
+  static void rememberSample(String url) => _lastSample = url;
+
   static void maybeProbe(
     Iterable<String> sampleUrls, {
     String? videoKey,
     bool lite = false,
   }) {
-    if (cdnService != CDNService.auto) return;
-    if (CdnAutoPicker.isRunning) return;
     final sample = sampleUrls.isEmpty ? null : sampleUrls.first;
     if (sample == null) return;
+    // 不管是不是自动模式都记下来：对话框测速要用。
+    _lastSample = sample;
+
+    if (cdnService != CDNService.auto) return;
+    if (CdnAutoPicker.isRunning) return;
 
     // 节流：同一台设备 5 分钟内只允许触发一轮（列表页/连播会把这里调很多次）。
     final now = DateTime.now();
