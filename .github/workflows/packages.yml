@@ -36,6 +36,10 @@ on:
         description: '构建 Android APK'
         type: boolean
         default: true
+      make_release:
+        description: '构建成功后发一个 beta 预发布'
+        type: boolean
+        default: true
   push:
     # 推分支即构建，省得先合进 main 才能试——CI 的第一次跑通常要迭代几轮
     branches:
@@ -137,3 +141,61 @@ jobs:
           name: PiliPlus-android
           path: build/app/outputs/flutter-apk/*.apk
           if-no-files-found: error
+
+  # 构建成功后发一个 beta 预发布。
+  # 关键是 `needs`：iOS 构建挂了就不会有半成品 release —— 前面那些"看起来成功"
+  # 的步骤不算证据，只有产物算。
+  release:
+    name: Publish beta prerelease
+    needs: [ios, android]
+    if: >-
+      ${{
+        always() &&
+        (github.event_name == 'push' || inputs.make_release) &&
+        needs.ios.result == 'success' &&
+        needs.android.result == 'success'
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: Rename for humans
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ver=$(grep -m1 '^version:' pubspec.yaml | awk '{print $2}' | cut -d+ -f1)
+          short=$(git rev-parse --short HEAD)
+          stamp=$(date -u +%Y%m%d-%H%M)
+          for apk in artifacts/PiliPlus-android/*.apk; do
+            abi=$(basename "$apk" .apk | sed 's/^app-//')
+            cp "$apk" "dist/PiliPlus_${ver}-beta_${stamp}_${short}_${abi}.apk"
+          done
+          cp artifacts/PiliPlus-ios-unsigned/PiliPlus.ipa \
+             "dist/PiliPlus_${ver}-beta_${stamp}_${short}_ios-unsigned.ipa"
+          echo "TAG=beta-${stamp}-${short}" >> "$GITHUB_ENV"
+          ls -lh dist
+
+      - name: Publish prerelease
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
+          prerelease: true
+          draft: false
+          generate_release_notes: true
+          body: |
+            beta 预发布（CI 自动产出）。
+
+            - `*_ios-unsigned.ipa`：**未签名**，请自行签名安装（AltStore / SideStore /
+              Sideloadly / TrollStore）。
+            - `*_<abi>.apk`：按 ABI 拆分，直接装。
+            - 构建自 commit ${{ github.sha }}。
+          files: dist/*
