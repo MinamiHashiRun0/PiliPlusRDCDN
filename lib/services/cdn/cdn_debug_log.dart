@@ -16,6 +16,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:PiliPlus/services/cdn/frame_profiler.dart';
 import 'package:PiliPlus/utils/path_utils.dart';
 import 'package:flutter/foundation.dart' show debugPrint, kDebugMode;
 
@@ -250,8 +251,12 @@ abstract final class CdnDebugLog {
   static String? get filePath => _file?.path;
 
   /// 开关。关闭时不写文件、不记内存（省电），但已有内容保留。
+  ///
+  /// 顺带联动帧耗时记录仪：用户反馈的"视频页一碰就卡""后台回来滑动也卡"是整机级
+  /// 现象，必须同时拿到帧数据才能判断是 UI 线程还是光栅线程的问题。
   static void setEnabled(bool value) {
     _enabled = value;
+    FrameProfiler.setEnabled(value);
     if (value) unawaited(_ensureOpen());
   }
 

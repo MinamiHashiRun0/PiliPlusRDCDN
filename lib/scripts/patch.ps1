@@ -176,6 +176,24 @@ foreach ($revert in $reverts) {
 }
 
 foreach ($patch in $patches) {
+    # layout_builder.patch 要整体注释掉 _LayoutBuilderElement 的嵌套 BuildScope。
+    # 它的原始动机（"LayoutBuilder 在 postFrameCallbacks / idle 阶段被标脏"）**上游
+    # 早已修好**：Flutter 3.47.5 原生就有 _deferredCallbackScheduled + _frameCallback
+    # 的延迟机制。所以这个补丁在新 SDK 上不但多余，还是**实打实的性能回退**——
+    # 去掉嵌套 BuildScope 后，LayoutBuilder 子树里任何 markNeedsBuild 都会冒泡到
+    # 根 scope，把重建范围从"一个小盒子"放大到"整棵树的一部分"。PiliPlus 里
+    # video_card / 各种 item 全是 LayoutBuilder，列表一滑就踩。
+    #
+    # 处理方式：先探测"原生是否已含延迟逻辑"，是则跳过该补丁（新版 SDK 自动获益，
+    # 老版 SDK 行为不变）；否则按原样打。
+    if ($patch -eq $LayoutBuilderPatch) {
+        $lb = Join-Path $env:FLUTTER_ROOT "packages/flutter/lib/src/widgets/layout_builder.dart"
+        $native = (Get-Content $lb -Raw) -match '_deferredCallbackScheduled'
+        if ($native) {
+            Write-Host "$patch SKIPPED (SDK 已原生支持延迟重建，无需且不应再打)"
+            continue
+        }
+    }
     git apply "$env:GITHUB_WORKSPACE/$patch"
     if ($LASTEXITCODE -eq 0) {
         Write-Host "$patch applied"

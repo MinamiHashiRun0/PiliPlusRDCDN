@@ -11,6 +11,7 @@ import 'dart:async';
 
 import 'package:PiliPlus/services/cdn/cdn_debug_log.dart';
 import 'package:PiliPlus/services/cdn/cdn_proxy_service.dart';
+import 'package:PiliPlus/services/cdn/frame_profiler.dart';
 import 'package:PiliPlus/services/cdn/proxy_core.dart';
 import 'package:PiliPlus/utils/utils.dart';
 import 'package:material_ui/material_ui.dart';
@@ -144,6 +145,40 @@ class _CdnDebugPageState extends State<CdnDebugPage> {
                           ),
                         ),
                       ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '帧耗时（回答"到底哪里卡"）',
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: scheme.primary,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  SelectableText(
+                    FrameProfiler.lastLine ?? '暂无采样（需开启调试日志并操作界面）',
+                    style: const TextStyle(
+                      fontSize: 11,
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    '怎么读：每秒一行。构建 = UI 线程（Dart：build/layout/setState），'
+                    '光栅 = GPU（Impeller/纹理）。哪边超 16.7ms 就是哪边的锅——'
+                    '构建慢说明是代码在狂重建，光栅慢说明是画面太重。'
+                    '这条不影响任何行为，只读。',
+                    style: TextStyle(fontSize: 12, color: scheme.outline),
+                  ),
                 ],
               ),
             ),
