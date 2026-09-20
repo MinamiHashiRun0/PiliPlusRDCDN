@@ -693,6 +693,15 @@ class VideoDetailController extends GetxController
     firstVideo = findVideoByQa(currentVideoQa.code, setCodecs: true);
     videoUrl = VideoUtils.getCdnUrl(firstVideo.playUrls);
 
+    // 「自动」模式下按需触发一轮测速：用这条视频自己的新鲜签名当样本。
+    // 本次播放用的是上一轮的排名（不阻塞启动），测完写盘供下一次用。
+    // 移动端走小额档（一轮约 100MB，桌面约 250MB）。
+    VideoUtils.maybeProbe(
+      firstVideo.playUrls,
+      videoKey: '$bvid:${cid.value}:${currentVideoQa.code}',
+      lite: PlatformUtils.isMobile,
+    );
+
     /// 根据currentAudioQa 重新设置audioUrl
     if (currentAudioQa != null) {
       final firstAudio = data.dash!.audio!.firstWhere(

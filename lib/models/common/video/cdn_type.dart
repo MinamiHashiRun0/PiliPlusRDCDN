@@ -6,6 +6,10 @@
 enum CDNService {
   baseUrl('基础URL（不推荐）'),
   backupUrl('备用URL'),
+
+  /// 自动：用本机实测吞吐排名里最快的那一个（见 services/cdn/cdn_probe.dart）。
+  /// 没有可用排名时行为等同 backupUrl（原样放过，不猜）。
+  auto('自动（按本机测速排名）'),
   ali('ali（阿里云）', 'upos-sz-mirrorali.bilivideo.com'),
   alib('alib（阿里云）', 'upos-sz-mirroralib.bilivideo.com'),
   alio1('alio1（阿里云）', 'upos-sz-mirroralio1.bilivideo.com'),

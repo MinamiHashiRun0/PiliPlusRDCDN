@@ -89,6 +89,12 @@ abstract final class SettingBoxKey {
       badCertificateCallback = 'badCertificateCallback',
       continuePlayingPart = 'continuePlayingPart',
       cdnSpeedTest = 'cdnSpeedTest',
+
+      /// 自动选节点用的测速排名（JSON 字符串，见 services/cdn/cdn_auto_picker.dart）
+      cdnSpeedTestRank = 'cdnSpeedTestRank',
+
+      /// 排名对应的网络指纹：换了 Wi-Fi/蜂窝就作废重测
+      cdnSpeedTestNetwork = 'cdnSpeedTestNetwork',
       horizontalPreview = 'horizontalPreview',
       banWordForReply = 'banWordForReply',
       banWordForZone = 'banWordForZone',

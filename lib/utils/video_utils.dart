@@ -1,14 +1,22 @@
 import 'package:PiliPlus/models/common/video/cdn_type.dart';
 import 'package:PiliPlus/models/common/video/video_decode_type.dart';
 import 'package:PiliPlus/models_new/live/live_room_play_info/codec.dart';
+import 'package:PiliPlus/services/cdn/cdn_auto_picker.dart';
+import 'package:PiliPlus/services/cdn/cdn_pick.dart';
+import 'package:PiliPlus/services/cdn/cdn_probe.dart';
 import 'package:PiliPlus/utils/extension/iterable_ext.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 
+/// 视频播放相关的工具。
+///
+/// [getCdnUrl] / [getLiveCdnUrl] / [selectCodec] 是**纯函数**（不碰存储），所以这个文件
+/// 只在一个地方依赖应用层：[bootstrap] 把用户偏好注入进来。这样 CDN 选择逻辑可以在
+/// 未 patch 的 Flutter SDK 上离线单测（见 test/services/cdn/cdn_pick_test.dart）。
 abstract final class VideoUtils {
-  static CDNService cdnService = Pref.defaultCDNService;
-  static String? liveCdnUrl = Pref.liveCdnUrl;
-  static bool disableAudioCDN = Pref.disableAudioCDN;
+  static CDNService cdnService = CDNService.backupUrl;
+  static String? liveCdnUrl;
+  static bool disableAudioCDN = false;
 
   static const _proxyTf = 'proxy-tf-all-ws.bilivideo.com';
 
@@ -26,6 +34,12 @@ abstract final class VideoUtils {
     bool isAudio = false,
   }) {
     defaultCDNService ??= cdnService;
+
+    if (defaultCDNService == CDNService.auto) {
+      final target = autoPickedHost(urls, CdnAutoPicker.resolve);
+      // 没有可用排名、或排名里挑不出这条视频自己的候选 → 原样放过（等同“备用URL”）。
+      return target == null ? urls.first : swapUrlHost(urls.first, target);
+    }
 
     if (defaultCDNService == CDNService.baseUrl) {
       return urls.first;
@@ -94,6 +108,61 @@ abstract final class VideoUtils {
     final urlInfo = e.urlInfo.getOrFirst(index);
     return (liveCdnUrl ?? urlInfo.host) + e.baseUrl + urlInfo.extra;
   }
+
+  /// 把用户设置注入进来。main 里在 GStorage.init() 之后调一次。
+  static void bootstrap() {
+    cdnService = Pref.defaultCDNService;
+    liveCdnUrl = Pref.liveCdnUrl;
+    disableAudioCDN = Pref.disableAudioCDN;
+  }
+
+  /// 播放前按需触发一轮测速（「自动」模式用）。
+  ///
+  /// 刻意做成「本次不阻塞」：这一轮拿到的是上一轮的排名，测完写盘供下一次播放用。
+  /// 好处是播放启动路径上不多一次网络往返；代价是第一次开自动要多等一个视频。
+  /// [sampleUrls] 是这条视频自己的候选地址（签名是新鲜的，必须当场用）。
+  ///
+  /// [lite] 给移动网络/移动端用的小额档：连接数与字节都减半，一轮总流量从约 250MB
+  /// 降到约 100MB（21 个候选）。默认 false（Wi-Fi/桌面）。
+  static void maybeProbe(
+    Iterable<String> sampleUrls, {
+    String? videoKey,
+    bool lite = false,
+  }) {
+    if (cdnService != CDNService.auto) return;
+    if (CdnAutoPicker.isRunning) return;
+    final sample = sampleUrls.isEmpty ? null : sampleUrls.first;
+    if (sample == null) return;
+
+    // 节流：同一台设备 5 分钟内只允许触发一轮（列表页/连播会把这里调很多次）。
+    final now = DateTime.now();
+    if (_lastProbeAt != null &&
+        now.difference(_lastProbeAt!) < const Duration(minutes: 5)) {
+      return;
+    }
+
+    // 网络指纹是异步算的：先刷新，再判断要不要测（换了 Wi-Fi 就该重测）。
+    // 先测完“要不要测”再打节流时间戳，避免「什么都没做也把下一轮挡住」。
+    _lastProbeAt = now;
+    CdnAutoPicker.primeNetwork()
+        .then((_) {
+          if (!CdnAutoPicker.needsRefresh()) return null;
+          return CdnAutoPicker.run(
+            sampleUrl: sample,
+            videoKey: videoKey,
+            config: lite ? CdnProbeConfig.mobile : const CdnProbeConfig(),
+          );
+        })
+        .catchError((Object e) {
+          if (kDebugMode) debugPrint('cdn auto probe failed: $e');
+          return null;
+        });
+  }
+
+  static DateTime? _lastProbeAt;
+
+  /// 单测/诊断用：重置节流时间戳。
+  static void resetProbeThrottle() => _lastProbeAt = null;
 
   static VideoDecodeFormatType selectCodec(
     Iterable<String> codecs,

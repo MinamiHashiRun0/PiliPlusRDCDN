@@ -21,7 +21,9 @@ version: 2.1.4+1
 
 environment:
   sdk: ">=3.13.0"
-  flutter: 3.47.4
+  # 上游是固定值 3.47.4；本地 Flutter 是 3.47.5，而 pub 从 Dart 3.9 起对 root package
+  # 会校验 flutter 约束的上限，故放宽下限。注意：构建 App 仍需 patch.ps1 对应的精确版本。
+  flutter: ">=3.47.4"
 
 # Dependencies specify other packages that your package needs in order to work.
 # To automatically upgrade your package dependencies to the latest versions
