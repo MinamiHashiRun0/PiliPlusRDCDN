@@ -1,4 +1,4 @@
-import 'dart:async' show StreamSubscription, Timer;
+import 'dart:async' show StreamSubscription, Timer, unawaited;
 import 'dart:convert' show ascii, utf8;
 import 'dart:io' show Platform;
 import 'dart:math' show max, min;
@@ -16,6 +16,7 @@ import 'package:PiliPlus/models/common/video/video_type.dart';
 import 'package:PiliPlus/models/user/danmaku_rule.dart';
 import 'package:PiliPlus/models/video/play/url.dart';
 import 'package:PiliPlus/models_new/video/video_shot/data.dart';
+import 'package:PiliPlus/services/cdn/cdn_proxy_service.dart';
 import 'package:PiliPlus/pages/danmaku/danmaku_model.dart';
 import 'package:PiliPlus/pages/sponsor_block/block_mixin.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
@@ -801,8 +802,25 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         ...buffer,
     };
 
-    String video = dataSource.videoSource;
-    if (dataSource.audioSource case final audio? when (audio.isNotEmpty)) {
+    // 本地并发代理：把两条流都指到 127.0.0.1，由代理内部用多连接去取。
+    // 未开启或启动失败时 rewrite 会原样返回 —— 代理只做加速，不做必需品。
+    var videoSource = dataSource.videoSource;
+    var audioSource = dataSource.audioSource;
+    if (dataSource is NetworkSource && CdnProxyService.instance.enabled) {
+      try {
+        videoSource = await CdnProxyService.instance.rewrite(videoSource);
+        if (audioSource != null && audioSource.isNotEmpty) {
+          audioSource = await CdnProxyService.instance.rewrite(audioSource);
+        }
+      } catch (e) {
+        if (kDebugMode) debugPrint('cdn proxy rewrite failed: $e');
+        videoSource = dataSource.videoSource;
+        audioSource = dataSource.audioSource;
+      }
+    }
+
+    String video = videoSource;
+    if (audioSource case final audio? when (audio.isNotEmpty)) {
       if (onlyPlayAudio.value) {
         video = audio;
       } else {
@@ -1578,6 +1596,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       AndroidHelper$ToDart.onUserLeaveHint = null;
     }
     _timer?.cancel();
+    // 播放页销毁：释放本地代理的引用（没有引用时它会自己停掉，省电、让出端口）
+    if (CdnProxyService.instance.isRunning) {
+      unawaited(CdnProxyService.instance.release());
+    }
     // _position.close();
     // _playerEventSubs?.cancel();
     // _sliderPosition.close();

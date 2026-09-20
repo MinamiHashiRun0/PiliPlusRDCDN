@@ -95,6 +95,12 @@ abstract final class SettingBoxKey {
 
       /// 排名对应的网络指纹：换了 Wi-Fi/蜂窝就作废重测
       cdnSpeedTestNetwork = 'cdnSpeedTestNetwork',
+
+      /// 本地并发代理（mpv → 127.0.0.1 → 多连接取流）。默认关，见 cdn_proxy.dart
+      cdnProxy = 'cdnProxy',
+
+      /// 代理的并发连接数
+      cdnProxyConnections = 'cdnProxyConnections',
       horizontalPreview = 'horizontalPreview',
       banWordForReply = 'banWordForReply',
       banWordForZone = 'banWordForZone',

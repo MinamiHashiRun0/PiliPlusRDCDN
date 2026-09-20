@@ -444,6 +444,18 @@ abstract final class Pref {
   static bool get cdnSpeedTest =>
       _setting.get(SettingBoxKey.cdnSpeedTest, defaultValue: true);
 
+  /// 本地并发代理。默认**关**：它会接管媒体流（mpv → 127.0.0.1），出问题的表现是播放
+  /// 卡住/花屏，所以先让用户主动开、可随时关。
+  static bool get cdnProxy =>
+      _setting.get(SettingBoxKey.cdnProxy, defaultValue: false);
+
+  /// 代理并发连接数。实测单连接常被压在 13–25 Mbps，8 条并发能到 60–77 Mbps；
+  /// 再多收益递减且增加调度开销，所以上限给到 16。
+  static int get cdnProxyConnections =>
+      (_setting.get(SettingBoxKey.cdnProxyConnections, defaultValue: 8) as int?)
+          ?.clamp(2, 16) ??
+      8;
+
   static bool get autoUpdate =>
       _setting.get(SettingBoxKey.autoUpdate, defaultValue: true);
 

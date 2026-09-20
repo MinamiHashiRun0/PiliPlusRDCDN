@@ -10,6 +10,7 @@ import 'package:PiliPlus/pages/setting/widgets/ordered_multi_select_dialog.dart'
 import 'package:PiliPlus/pages/setting/widgets/select_dialog.dart';
 import 'package:PiliPlus/plugin/pl_player/models/audio_output_type.dart';
 import 'package:PiliPlus/plugin/pl_player/models/hwdec_type.dart';
+import 'package:PiliPlus/services/cdn/cdn_proxy_service.dart';
 import 'package:PiliPlus/utils/filtering_text.dart';
 import 'package:PiliPlus/utils/storage.dart';
 import 'package:PiliPlus/utils/storage_key.dart';
@@ -82,6 +83,23 @@ List<SettingsModel> get videoSettings => [
     setKey: SettingBoxKey.disableAudioCDN,
     defaultVal: false,
     onChanged: (value) => VideoUtils.disableAudioCDN = value,
+  ),
+  SwitchModel(
+    title: 'CDN 并发代理',
+    subtitle: '把播放流交给本机代理，用多连接并行取流；单连接被限速时才有明显效果。'
+        '播放异常请关掉此项',
+    leading: const Icon(Icons.hub_outlined),
+    setKey: SettingBoxKey.cdnProxy,
+    defaultVal: false,
+  ),
+  NormalModel(
+    title: '代理连接数',
+    leading: const Icon(Icons.call_split),
+    getSubtitle: () {
+      final status = proxyStatusLine();
+      return '当前：${Pref.cdnProxyConnections} 条（2–16）\n$status';
+    },
+    onTap: _showProxyConnectionsDialog,
   ),
   NormalModel(
     title: '默认画质',
@@ -187,6 +205,35 @@ Future<void> _showCDNDialog(BuildContext context, VoidCallback setState) async {
   if (res != null) {
     VideoUtils.cdnService = res;
     await GStorage.setting.put(SettingBoxKey.CDNService, res.name);
+    setState();
+  }
+}
+
+/// 代理连接数。实测单连接常被压在 13–25 Mbps，8 条并发能到 60–77 Mbps；
+/// 再多收益递减且调度开销上升，所以只给到 16。
+Future<void> _showProxyConnectionsDialog(
+  BuildContext context,
+  VoidCallback setState,
+) async {
+  final res = await showDialog<int>(
+    context: context,
+    builder: (context) => SelectDialog<int>(
+      title: '代理连接数',
+      value: Pref.cdnProxyConnections,
+      values: const [
+        (2, '2 条 · 最省流量'),
+        (4, '4 条'),
+        (6, '6 条'),
+        (8, '8 条 · 默认'),
+        (12, '12 条'),
+        (16, '16 条 · 上限'),
+      ],
+    ),
+  );
+  if (res != null) {
+    await GStorage.setting.put(SettingBoxKey.cdnProxyConnections, res);
+    // 连接数是启动参数，改动后让代理下次播放重新创建
+    await CdnProxyService.instance.stop();
     setState();
   }
 }
