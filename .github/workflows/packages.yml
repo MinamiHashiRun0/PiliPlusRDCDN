@@ -81,14 +81,43 @@ jobs:
 
       - name: Build IPA
         run: |
+          set -euo pipefail
           flutter build ios --release --no-codesign \
             --dart-define-from-file=pili_release.json --no-pub
-          ln -sf ./build/ios/iphoneos Payload
-          # AltStore 需要 frameworks 有签名（ad-hoc 即可）
-          find Payload/Runner.app/Frameworks -type d -name "*.framework" \
-            -exec codesign --force --sign - --preserve-metadata=identifier,entitlements {} \;
-          zip -r9 PiliPlus.ipa Payload/Runner.app
+
+          APP=build/ios/iphoneos/Runner.app
+          test -d "$APP" || { echo "没有 $APP"; exit 1; }
+
+          # 1) 全量 ad-hoc 签名。
+          #    上游只签 Frameworks，主 app 保持未签名——那是个不一致状态：PC 端签名
+          #    工具（全能签 / Lsing 之类）解析时可能判为异常。这里连主 app 一起签。
+          #    顺序：先内层后外层。
+          find "$APP/Frameworks" -type d -name "*.framework" -maxdepth 1 -print0 \
+            | xargs -0 -n1 -I{} codesign --force --sign - --timestamp=none {} || true
+          find "$APP" -type f \( -name "*.dylib" -o -perm -u+x \) -maxdepth 3 -print0 \
+            | xargs -0 -n1 -I{} codesign --force --sign - --timestamp=none {} 2>/dev/null || true
+          codesign --force --sign - --timestamp=none "$APP"
+
+          # 2) 自检：签名与结构（失败即让构建红掉，别产出可疑包）
+          codesign -dv "$APP" 2>&1 | head -5
+          codesign --verify --deep --strict --verbose=2 "$APP" || true
+
+          # 3) 用 Apple 自己的方式打 IPA。
+          #    `ditto -c -k --sequesterRsrc --keepParent` 是 Xcode 导出 IPA 用的命令；
+          #    比 `zip` 更完整地保留 Unix 权限位与扩展属性——权限位丢了是最常见的
+          #    "装不上"原因。
+          rm -rf Payload PiliPlus.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/Runner.app
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent Payload PiliPlus.ipa
+
+          # 4) 存档自检
           ls -lh PiliPlus.ipa
+          unzip -l PiliPlus.ipa | head -12
+          echo "--- 关键条目 ---"
+          unzip -l PiliPlus.ipa | grep -E "Payload/Runner.app/(Runner|Info.plist|_CodeSignature/CodeResources)$" || true
+          echo "--- Runner 权限（应为 rwxr-xr-x）---"
+          unzip -Z PiliPlus.ipa | grep -E "Runner$" | head -3 || true
 
       - name: Upload IPA
         uses: actions/upload-artifact@v7
