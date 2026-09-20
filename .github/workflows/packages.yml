@@ -43,6 +43,7 @@ on:
   push:
     # 推分支即构建，省得先合进 main 才能试——CI 的第一次跑通常要迭代几轮
     branches:
+      - main
       - 'feat/**'
       - 'fix/**'
     paths-ignore:
