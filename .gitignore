@@ -149,4 +149,9 @@ pili_release.json
 
 dist
 
+# 上游这条 `test*` 本意大概是排除测试产物，但它会连 test/ 目录一起吞掉，
+# 导致新加的测试文件被 git add 静默跳过（CI 上就成了 "目录不存在"）。
+# 这里把真实的测试目录放回来，其余 test* 规则照旧。
 test*
+!/test/
+!/test/**
